@@ -572,7 +572,7 @@ class SubjectRankingModel:
         return score
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Scene-aware vertical auto-reframe with segmentation, presets, "
@@ -797,7 +797,7 @@ def parse_args() -> argparse.Namespace:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def setup_logging(level: str) -> None:
@@ -861,10 +861,64 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     args.skip_saliency = args.saliency_model == "off"
     args.skip_pose = args.camera_mode == "locked" or args.fast
     args.retina_masks = args.camera_mode != "locked" and not args.fast
-    if args.camera_mode == "locked" and args.seg_model == "yolo11n-seg.pt":
-        args.seg_model = "yolo11n.pt"
+    # Match on the filename so an absolute baked path still swaps to the
+    # detection checkpoint that lives beside it.
+    if args.camera_mode == "locked" and Path(args.seg_model).name == "yolo11n-seg.pt":
+        args.seg_model = str(Path(args.seg_model).with_name("yolo11n.pt"))
 
     return args
+
+
+def build_namespace(
+    input_path: str,
+    output_path: str,
+    *,
+    preset: str = "talking_head",
+    start: float = 0.0,
+    duration: float | None = None,
+    fast: bool = False,
+    saliency_model: str | None = None,
+    output_width: int = 1080,
+    output_height: int = 1920,
+    save_debug_preview: bool = False,
+    debug_path: str = "",
+    video_encoder: str | None = None,
+    device: str | None = None,
+    seg_model: str | None = None,
+    log_level: str = "INFO",
+) -> argparse.Namespace:
+    """Build a preset-applied namespace without reading process arguments."""
+    argv: list[str] = [
+        input_path,
+        output_path,
+        "--preset",
+        preset,
+        "--start",
+        str(start),
+        "--output-width",
+        str(output_width),
+        "--output-height",
+        str(output_height),
+        "--log-level",
+        log_level,
+    ]
+    if duration is not None:
+        argv += ["--duration", str(duration)]
+    if fast:
+        argv.append("--fast")
+    if saliency_model:
+        argv += ["--saliency-model", saliency_model]
+    if save_debug_preview:
+        argv.append("--save-debug-preview")
+    if debug_path:
+        argv += ["--debug-path", debug_path]
+    if video_encoder:
+        argv += ["--video-encoder", video_encoder]
+    if device:
+        argv += ["--device", device]
+    if seg_model:
+        argv += ["--seg-model", seg_model]
+    return apply_preset(parse_args(argv))
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -3034,7 +3088,7 @@ def reset_for_new_scene(
     state.force_hard_cut = hard_cut
 
 
-def process_video(args: argparse.Namespace) -> None:
+def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[str, Any]:
     input_path = Path(args.input)
     output_path = Path(args.output)
     start = max(0.0, float(args.start or 0.0))
@@ -3079,7 +3133,11 @@ def process_video(args: argparse.Namespace) -> None:
         args.retina_masks,
         yolo_device or "auto",
     )
-    model = YOLO(args.seg_model)
+    if model is None:
+        model = YOLO(args.seg_model)
+    else:
+        # A warm Ultralytics model keeps ByteTrack state on its predictor.
+        model.predictor = None
     class_names = model.names
     face_helper = MediaPipeFaceHelper(stride=args.face_stride)
     pose_helper = None if args.skip_pose else MediaPipePoseHelper()
@@ -3628,6 +3686,7 @@ def process_video(args: argparse.Namespace) -> None:
             "saliency_device": saliency_telemetry.get("device"),
         }
         logging.info("Summary: %s", json.dumps(summary, ensure_ascii=False))
+        return summary
 
 
 def main() -> int:
