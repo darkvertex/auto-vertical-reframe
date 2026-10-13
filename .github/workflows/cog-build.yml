@@ -1,0 +1,85 @@
+name: CI
+
+# Pull requests lint, run unit tests, and build the Cog image.
+# The Cog job then runs one CPU prediction. Nothing is pushed.
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  workflow_dispatch:
+
+env:
+  COG_VERSION: v0.22.0
+  IMAGE_TAG: auto-vertical-reframe:ci
+
+jobs:
+  lint-and-test:
+    name: lint and pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run ruff check src tests predict.py scripts
+
+      - name: Black
+        run: uv run black --check src tests predict.py scripts
+
+      - name: pytest
+        run: uv run pytest -q
+
+  build:
+    name: cog build + smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # CUDA base + torch is several GB; reclaim space before the build.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          docker-images: false
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Cog
+        uses: ./.github/actions/setup-cog
+        with:
+          cog-version: ${{ env.COG_VERSION }}
+
+      - name: cog build
+        run: cog build -t "$IMAGE_TAG"
+
+      - name: Report image size
+        run: |
+          docker image inspect "$IMAGE_TAG" --format 'Image size: {{ .Size }} bytes'
+
+      # No GPU on the runner. Cog retries without one, and the predictor
+      # selects CPU. duration=1 and fast=true keep the smoke test short.
+      - name: cog predict smoke test
+        run: |
+          cog predict "$IMAGE_TAG" \
+            -i video=@assets/demo_source.mp4 \
+            -i duration=1 \
+            -i fast=true \
+            -i saliency_model=off \
+            -o /tmp/output.json
+
+      - name: Validate output
+        run: python3 scripts/validate_cog_output.py /tmp/output.json
