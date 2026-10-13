@@ -36,6 +36,30 @@ INFO | Summary: {"preset": "talking_head", "frames_processed": 192, "frames_with
 
 The result is a 1080×1920 MP4 with the original audio. Full-quality demo files: [demo_source.mp4](assets/demo_source.mp4), [demo_vertical.mp4](assets/demo_vertical.mp4).
 
+## Run on Replicate
+
+Hosted model: [darkvertex/auto-vertical-reframe](https://replicate.com/darkvertex/auto-vertical-reframe). No local GPU or Python install.
+
+```bash
+cog predict r8.im/darkvertex/auto-vertical-reframe \
+  -i video=@input.mp4 \
+  -i preset=talking_head \
+  -o output.json
+```
+
+```python
+import replicate
+
+output = replicate.run(
+    "darkvertex/auto-vertical-reframe",
+    input={"video": open("input.mp4", "rb"), "preset": "talking_head"},
+)
+```
+
+The image returns the vertical MP4, a JSON summary, and a debug MP4 when `save_debug_preview` is set. Presets match the CLI (`talking_head`, `sports`, `pets`, `cars`, `movie`). `duration` is seconds, and `0` reframes the whole clip. Saliency is `handcrafted` or `off`. DeepGaze is not in the image. The container encodes with `libx264` on CUDA when a GPU is present, and on CPU otherwise.
+
+Pushes to `main` build and publish that image. The release workflow reads `REPLICATE_CLI_AUTH_TOKEN` from the `production` GitHub Environment. That value is the CLI auth token from [replicate.com/auth/token](https://replicate.com/auth/token), not an `r8_` API token. Pull requests build the image and run a one-second CPU smoke test, and they do not push.
+
 ## Convert a talking-head video to vertical 9:16
 
 For interviews, podcasts, and vlogs, where a naive center crop loses the speaker the moment they move. The `talking_head` preset tracks people and frames on the face.
@@ -133,8 +157,7 @@ Run `verthor --help` for the full list, including motion damping, per-frame step
 ## Limitations
 
 - Beta: CLI flags may change between versions.
-- No automated tests yet.
-- Linux and Windows are untested.
+- Linux is covered by the Replicate image and the CI smoke test. Windows is untested.
 - `movie` holds one static crop per shot, so a subject that walks across the frame can leave it.
 - `sports` rarely switches to the player with the ball once it is tracking someone, and ignores vehicles while any person is in frame.
 - `--speaker-json` is a placeholder for future speaker-aware ranking.
@@ -149,18 +172,23 @@ Double-click `run_verthor.command`. It provisions the venv and prompts for the v
 ### From source
 
 ```bash
-git clone https://github.com/KazKozDev/auto-vertical-reframe.git
+git clone https://github.com/darkvertex/auto-vertical-reframe.git
 cd auto-vertical-reframe
-python3 -m venv .venv && source .venv/bin/activate
-pip install -U pip
-pip install -e .
+uv sync
+uv run verthor input.mp4 output_vertical.mp4 --preset talking_head
 ```
 
-The repository includes the default segmentation weights, `yolo11n-seg.pt`.
+Linux installs PyTorch from the CUDA 12.1 wheel index. macOS uses the PyPI wheels. For a CPU-only Linux checkout:
+
+```bash
+uv sync --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+The repository includes the default segmentation weights, `yolo11n-seg.pt`. The `movie` preset downloads `yolo11n.pt` on first use; the Replicate image bakes that file in at build time.
 
 ### Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The package is `src/verthor/`: `auto_reframe.py` holds the pipeline and `__main__.py` is the `python -m verthor` entry point.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The package is `src/verthor/`: `auto_reframe.py` holds the pipeline and `__main__.py` is the `python -m verthor` entry point. `predict.py` is the Cog entry point.
 
 </details>
 

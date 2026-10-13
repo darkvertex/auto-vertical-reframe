@@ -22,11 +22,49 @@ dependencies = [
 [project.scripts]
 verthor = "verthor.auto_reframe:main"
 
+[dependency-groups]
+dev = [
+  "black>=24",
+  "poethepoet>=0.32",
+  "pytest>=8",
+  "ruff>=0.6",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv]
+package = true
+
+# The republished 0.10.14 metadata requires jax, which the legacy
+# solutions API does not import. Drop it so the image is not a JAX stack.
+[[tool.uv.dependency-metadata]]
+name = "mediapipe"
+version = "0.10.14"
+requires-dist = [
+  "absl-py",
+  "attrs>=19.1.0",
+  "flatbuffers>=2.0",
+  "matplotlib",
+  "numpy",
+  "opencv-contrib-python",
+  "protobuf>=4.25.3,<5",
+  "sounddevice>=0.4.4",
+]
+
+# Linux resolves torch from the CUDA 12.1 index, which is the newest CUDA
+# build Cog 0.22 still pairs with cu121. macOS keeps the PyPI wheels.
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux'" }]
 
 [tool.black]
 line-length = 88
@@ -38,3 +76,23 @@ line-length = 88
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Cog requires Input() defaults on the predict signature.
+"predict.py" = ["B008"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "scripts"]
+testpaths = ["tests"]
+
+[tool.poe.tasks.cog-build]
+help = "Build the Cog Docker image"
+cmd = "cog build"
+
+[tool.poe.tasks.cog-push]
+help = "Push the Cog image to Replicate"
+cmd = "cog push"
+
+[tool.poe.tasks.cog-deploy]
+help = "Build the Cog image, then push it to Replicate"
+sequence = ["cog-build", "cog-push"]

@@ -1,0 +1,25 @@
+# https://docs.docker.com/engine/reference/builder/#dockerignore-file
+
+**/.git
+**/.github
+**/.gitignore
+.python-version
+.cog
+
+__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+**/*.pyc
+
+/venv
+/.venv
+*.egg-info
+
+# Demo media is a CI input, not a runtime asset.
+assets/*.mp4
+assets/*.mov
+assets/*.gif
+
+tests
+uv.lock

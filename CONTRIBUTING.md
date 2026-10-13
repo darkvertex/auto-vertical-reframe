@@ -7,14 +7,14 @@ Thanks for your interest in improving Verthor.
 1. Fork the repository and create a feature branch off `main`.
 2. Set up a local environment:
    ```bash
-   python3 -m venv .venv && source .venv/bin/activate
-   pip install -e .
+   uv sync
    ```
 3. Make your changes in a focused commit or small series of commits.
-4. Run the linters locally before opening a PR:
+4. Run the linters and tests locally before opening a PR:
    ```bash
-   ruff check src
-   black --check src
+   uv run ruff check src tests predict.py scripts
+   uv run black --check src tests predict.py scripts
+   uv run pytest -q
    ```
 5. Open a pull request describing the motivation, the change, and any new CLI flags or defaults.
 
