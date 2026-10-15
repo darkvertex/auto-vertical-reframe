@@ -60,6 +60,70 @@ The image returns the vertical MP4, a JSON summary, and a debug MP4 when `save_d
 
 Pushes to `main` build and publish that image. The release workflow reads `REPLICATE_CLI_AUTH_TOKEN` from the `production` GitHub Environment. That value is the CLI auth token from [replicate.com/auth/token](https://replicate.com/auth/token), not an `r8_` API token. Pull requests build the image and run a one-second CPU smoke test, and they do not push.
 
+## Run on Runpod
+
+The root `Dockerfile` is a Runpod queue worker. `cog build` does not read it, and this image is not part of the Replicate release. Build it for linux/amd64 and deploy it as a Queue endpoint:
+
+```bash
+docker build --platform linux/amd64 -t auto-vertical-reframe-runpod .
+```
+
+In the endpoint's Advanced settings, set the execution timeout to 24 hours and the job TTL to 7 days. The platform default is 10 minutes, which stops a long clip before it finishes. The worker itself has no shorter deadline. Select CUDA 12.1 or newer so the driver matches the image.
+
+Set these environment variables on the endpoint so the MP4 is uploaded instead of returned in the job payload (`/run` accepts 10 MB, and a vertical video is larger than that):
+
+| Variable | What it does |
+|---|---|
+| `BUCKET_ENDPOINT_URL` | S3-compatible endpoint, including the bucket name |
+| `BUCKET_ACCESS_KEY_ID` | Access key |
+| `BUCKET_SECRET_ACCESS_KEY` | Secret key |
+
+Input fields match the Replicate model: `video` (http(s) URL or local path), `preset`, `start`, `duration` (`0` reframes the whole clip), `fast`, `saliency_model` (`default`, `handcrafted`, or `off`), `output_width`, `output_height`, and `save_debug_preview`. The result has `video`, a JSON `summary` string, and `debug_video` when the preview was requested. Each value is a presigned URL that lasts 7 days. With no bucket configured, the worker writes the file locally and returns that path, which is how `python handler.py` behaves with `test_input.json`.
+
+Send long jobs to `/run` and poll `/status`. Put the same limits on the request so it stays long even if the endpoint setting was left at the default. `ttl` starts when the job is submitted and includes queue time, so it has to cover the wait plus the run. `/runsync` keeps the HTTP connection open and only retains its result for a minute. Async results stay available for 30 minutes after completion, so save the video URL when the job completes.
+
+```python
+import os
+import time
+
+import requests
+
+endpoint_id = "YOUR_ENDPOINT_ID"
+headers = {
+    "Authorization": f"Bearer {os.environ['RUNPOD_API_KEY']}",
+    "Content-Type": "application/json",
+}
+base = f"https://api.runpod.ai/v2/{endpoint_id}"
+submitted = requests.post(
+    f"{base}/run",
+    headers=headers,
+    timeout=60,
+    json={
+        "input": {
+            "video": "https://example.com/input.mp4",
+            "preset": "talking_head",
+        },
+        "policy": {
+            "executionTimeout": 86400000,
+            "ttl": 604800000,
+        },
+    },
+).json()
+
+job_id = submitted["id"]
+while True:
+    status = requests.get(
+        f"{base}/status/{job_id}", headers=headers, timeout=60
+    ).json()
+    if status["status"] in {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}:
+        break
+    time.sleep(5)
+
+print(status["output"]["video"])
+```
+
+Callers who need longer than 24 hours can raise `executionTimeout` up to 7 days, and must keep `ttl` at least as long as the queue wait plus that run.
+
 ## Convert a talking-head video to vertical 9:16
 
 For interviews, podcasts, and vlogs, where a naive center crop loses the speaker the moment they move. The `talking_head` preset tracks people and frames on the face.
@@ -188,7 +252,7 @@ The repository includes the default segmentation weights, `yolo11n-seg.pt`. The 
 
 ### Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The package is `src/verthor/`: `auto_reframe.py` holds the pipeline and `__main__.py` is the `python -m verthor` entry point. `predict.py` is the Cog entry point.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The package is `src/verthor/`: `auto_reframe.py` holds the pipeline and `__main__.py` is the `python -m verthor` entry point. `predict.py` is the Cog entry point. `handler.py` is the Runpod entry point. Both call `verthor.reframe_job`.
 
 </details>
 
