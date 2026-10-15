@@ -14,12 +14,7 @@ _SRC = str(LocalPath(__file__).resolve().parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from verthor.reframe_job import (  # noqa: E402
-    PRESETS,
-    SALIENCY_MODELS,
-    load_models,
-    reframe_video,
-)
+from verthor.reframe_job import load_models, reframe_video  # noqa: E402
 
 
 class Output(BaseModel):
@@ -39,7 +34,7 @@ class Predictor(BasePredictor):
         preset: str = Input(
             description="Framing preset",
             default="talking_head",
-            choices=list(PRESETS),
+            choices=["talking_head", "sports", "pets", "cars", "movie"],
         ),
         start: float = Input(
             description="Start time in seconds",
@@ -61,7 +56,7 @@ class Predictor(BasePredictor):
                 "DeepGaze is not available in this image."
             ),
             default="default",
-            choices=list(SALIENCY_MODELS),
+            choices=["default", "handcrafted", "off"],
         ),
         output_width: int = Input(
             description="Output width in pixels",
