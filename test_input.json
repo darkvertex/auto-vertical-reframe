@@ -1,0 +1,8 @@
+{
+  "input": {
+    "video": "assets/demo_source.mp4",
+    "duration": 1,
+    "fast": true,
+    "saliency_model": "off"
+  }
+}

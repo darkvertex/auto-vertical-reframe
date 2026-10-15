@@ -12,8 +12,8 @@ Thanks for your interest in improving Verthor.
 3. Make your changes in a focused commit or small series of commits.
 4. Run the linters and tests locally before opening a PR:
    ```bash
-   uv run ruff check src tests predict.py scripts
-   uv run black --check src tests predict.py scripts
+   uv run ruff check src tests predict.py handler.py scripts
+   uv run black --check src tests predict.py handler.py scripts
    uv run pytest -q
    ```
 5. Open a pull request describing the motivation, the change, and any new CLI flags or defaults.
