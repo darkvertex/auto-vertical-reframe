@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 - Runpod Serverless worker (`handler.py`, `Dockerfile`) for queue endpoints. It takes the same inputs as the Cog predictor, uploads the MP4 when bucket credentials are set, and is meant to run with a 24-hour execution timeout and a 7-day job TTL.
+- The Runpod worker downloads source videos with a `verthor/0.1` User-Agent. Cloudflare answers Python's default urllib agent with HTTP 403.
 - Cog predictor and `cog.yaml` for [darkvertex/auto-vertical-reframe](https://replicate.com/darkvertex/auto-vertical-reframe). The image bakes YOLO weights and returns the vertical MP4 plus a JSON summary.
 - `uv` project metadata, `uv.lock`, and a dev dependency group.
 - GitHub Actions: pull requests lint, test, and smoke-test the Cog image; pushes to `main` release it to Replicate.
