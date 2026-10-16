@@ -10,6 +10,7 @@ import pytest
 from handler import (
     EXECUTION_TIMEOUT_MS,
     JOB_TTL_MS,
+    acquire_video,
     parse_input,
     run_job,
 )
@@ -168,6 +169,55 @@ def test_pipeline_errors_propagate(tmp_path: Path) -> None:
             publish=_unused,
             reframe=boom,
         )
+
+
+def test_download_sends_a_non_urllib_user_agent(monkeypatch, tmp_path: Path) -> None:
+    import urllib.request
+
+    captured: dict[str, str] = {}
+
+    class _Body:
+        def read(self, size: int = -1) -> bytes:
+            return b""
+
+        def __enter__(self) -> _Body:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(request: urllib.request.Request, timeout: object = None) -> _Body:
+        del timeout
+        header = request.get_header("User-agent")
+        assert header is not None
+        captured["user_agent"] = header
+        return _Body()
+
+    monkeypatch.setattr("handler.urllib.request.urlopen", fake_urlopen)
+    dest = tmp_path / "clip.mp4"
+    acquire_video("https://example.com/clip.mp4", dest)
+
+    assert captured["user_agent"] == "verthor/0.1"
+    assert "urllib" not in captured["user_agent"].lower()
+    assert dest.is_file()
+
+
+def test_download_http_error_names_the_status(monkeypatch, tmp_path: Path) -> None:
+    import urllib.error
+
+    def fake_urlopen(request: object, timeout: object = None) -> object:
+        del request, timeout
+        raise urllib.error.HTTPError(
+            "https://example.com/clip.mp4",
+            403,
+            "Forbidden",
+            hdrs=None,
+            fp=None,
+        )
+
+    monkeypatch.setattr("handler.urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError, match="HTTP 403 Forbidden"):
+        acquire_video("https://example.com/clip.mp4", tmp_path / "clip.mp4")
 
 
 def _unused(job_id: str, path: Path) -> str:

@@ -16,6 +16,7 @@ import json
 import re
 import shutil
 import sys
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -123,15 +124,33 @@ def parse_input(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Cloudflare rejects Python's default urllib User-Agent with HTTP 403.
+_DOWNLOAD_USER_AGENT = "verthor/0.1"
+
+
 def acquire_video(source: str, dest: Path) -> None:
     """Copy a local file or download an http(s) URL into ``dest``."""
     if source.startswith(("http://", "https://")):
-        urllib.request.urlretrieve(source, dest)
+        _download_video(source, dest)
         return
     path = Path(source)
     if not path.is_file():
         raise ValueError(f"video not found: {source}")
     shutil.copy(path, dest)
+
+
+def _download_video(url: str, dest: Path) -> None:
+    request = urllib.request.Request(url, headers={"User-Agent": _DOWNLOAD_USER_AGENT})
+    try:
+        with (
+            urllib.request.urlopen(request) as response,
+            dest.open("wb") as handle,
+        ):
+            shutil.copyfileobj(response, handle)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"Could not download video: HTTP {exc.code} {exc.reason}"
+        ) from exc
 
 
 def _safe_job_id(job_id: str) -> str:
