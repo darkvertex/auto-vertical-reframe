@@ -56,7 +56,7 @@ output = replicate.run(
 )
 ```
 
-The image returns the vertical MP4, a JSON summary, and a debug MP4 when `save_debug_preview` is set. Presets match the CLI (`talking_head`, `sports`, `pets`, `cars`, `movie`). `duration` is seconds, and `0` reframes the whole clip. Saliency is `handcrafted` or `off`. DeepGaze is not in the image. The container encodes with `libx264` on CUDA when a GPU is present, and on CPU otherwise.
+The image returns the vertical MP4, a JSON summary, and a debug MP4 when `save_debug_preview` is set. Presets match the CLI (`talking_head`, `sports`, `pets`, `cars`, `movie`). `duration` is seconds, and `0` reframes the whole clip. Saliency is `handcrafted` or `off`. DeepGaze is not in the image. YOLO runs on CUDA when a GPU is present, and on CPU otherwise. The default encoder is `hevc_nvenc`. If ffmpeg does not list it, the job falls back to `libx264`.
 
 Pushes to `main` build and publish that image. The release workflow reads `REPLICATE_CLI_AUTH_TOKEN` from the `production` GitHub Environment. That value is the CLI auth token from [replicate.com/auth/token](https://replicate.com/auth/token), not an `r8_` API token. Pull requests build the image and run a one-second CPU smoke test, and they do not push.
 
@@ -187,10 +187,11 @@ The whole pipeline lives in `src/verthor/auto_reframe.py`.
 | `--two-person-framing` | off (on for `sports`) | Frame two people together; `--no-two-person-framing` disables |
 | `--fast` | off | Smaller YOLO input, skip pose, masks, and saliency |
 | `--device` | auto | YOLO inference device (`cpu`, `mps`, `0`, …) |
-| `--scene-threshold` | `3.0` | Scene-cut sensitivity |
+| `--scene-threshold` | `3.0` | Scene-cut sensitivity. Detection samples at about 15 fps |
 | `--continuous` | off | One shot. Skip scene detection and its extra full decode |
-| `--video-encoder` | `h264_videotoolbox` | ffmpeg encoder; falls back to `libx264` if missing |
-| `--crf` | `18` | Quality for `libx264` |
+| `--pose-stride` | `1` | Run pose every N analyzed frames and reuse the last pose |
+| `--video-encoder` | `hevc_nvenc` | ffmpeg encoder. Falls back to `libx264` when that encoder is missing |
+| `--crf` | `18` | Quality. `libx264` uses it as CRF; NVENC uses it as CQ |
 | `--post-restore` | off | Light denoise and unsharp pass in ffmpeg |
 
 Run `verthor --help` for the full list, including motion damping, per-frame step limits, and locked-camera tuning.

@@ -8,6 +8,8 @@ import math
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -308,12 +310,8 @@ class HandcraftedSaliencyHelper:
             saliency_small = saliency_small * 0.72 + motion * 0.28
 
         self.prev_gray_small = gray_small
-
-        return cv2.resize(
-            saliency_small,
-            (frame_w, frame_h),
-            interpolation=cv2.INTER_LINEAR,
-        )
+        # Stay on the ~320px proxy. Callers scale boxes into this map.
+        return saliency_small
 
     def reset_temporal_state(self) -> None:
         self.prev_gray_small = None
@@ -756,6 +754,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run face detection every N analyzed frames; reuse the last face.",
     )
     parser.add_argument(
+        "--pose-stride",
+        type=int,
+        default=None,
+        help="Run pose every N analyzed frames; reuse the last pose. Default 1.",
+    )
+    parser.add_argument(
         "--saliency-model",
         choices=["auto", "deepgazemr", "handcrafted", "off"],
         default=None,
@@ -790,7 +794,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Apply light unsharp/denoise during final ffmpeg stage",
     )
 
-    parser.add_argument("--video-encoder", default="h264_videotoolbox")
+    parser.add_argument("--video-encoder", default="hevc_nvenc")
     parser.add_argument("--audio-bitrate", default="192k")
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--preset-ffmpeg", default="medium")
@@ -850,6 +854,8 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
         args.analyze_stride = int(preset.get("analyze_stride", 1))
     if args.face_stride is None:
         args.face_stride = int(preset.get("face_stride", 1))
+    if args.pose_stride is None:
+        args.pose_stride = int(preset.get("pose_stride", 1))
     if args.saliency_model is None:
         args.saliency_model = (
             "off" if args.camera_mode == "locked" or args.fast else "handcrafted"
@@ -863,6 +869,7 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
 
     args.analyze_stride = max(1, int(args.analyze_stride))
     args.face_stride = max(1, int(args.face_stride))
+    args.pose_stride = max(1, int(args.pose_stride))
     args.skip_saliency = args.saliency_model == "off"
     args.skip_pose = args.camera_mode == "locked" or args.fast
     args.retina_masks = args.camera_mode != "locked" and not args.fast
@@ -1105,7 +1112,14 @@ POSE_LANDMARK_NAMES = {
 
 
 class MediaPipePoseHelper:
-    def __init__(self, min_detection_confidence: float = 0.35):
+    def __init__(
+        self,
+        min_detection_confidence: float = 0.35,
+        stride: int = 1,
+    ):
+        self.stride = max(1, stride)
+        self._cache: dict[int, dict | None] = {}
+        self._cache_age: dict[int, int] = {}
         self.detector = None
         self.min_visibility = 0.35
         if mp_pose is None:
@@ -1135,10 +1149,35 @@ class MediaPipePoseHelper:
         frame_bgr: np.ndarray,
         person_box: tuple[int, int, int, int],
         pad_ratio: float = 0.12,
+        track_id: int | None = None,
     ) -> dict | None:
         if self.detector is None:
             return None
+        if (
+            self.stride > 1
+            and track_id is not None
+            and track_id in self._cache
+            and self._cache_age.get(track_id, 0) < self.stride - 1
+        ):
+            self._cache_age[track_id] += 1
+            return self._cache[track_id]
 
+        result = self._detect_in_person_box(frame_bgr, person_box, pad_ratio)
+        if track_id is not None:
+            self._cache[track_id] = result
+            self._cache_age[track_id] = 0
+        return result
+
+    def reset_cache(self) -> None:
+        self._cache.clear()
+        self._cache_age.clear()
+
+    def _detect_in_person_box(
+        self,
+        frame_bgr: np.ndarray,
+        person_box: tuple[int, int, int, int],
+        pad_ratio: float = 0.12,
+    ) -> dict | None:
         h, w = frame_bgr.shape[:2]
         x1, y1, x2, y2 = person_box
         bw = max(1, x2 - x1)
@@ -1292,10 +1331,25 @@ class MediaPipePoseHelper:
         }
 
 
+def scene_frame_skip(fps: float) -> int:
+    """Extra frames PySceneDetect should not decode. Targets about 15 fps."""
+    if fps <= 15:
+        return 0
+    return max(0, int(round(fps / 15.0)) - 1)
+
+
+def should_extract_source_clip(start: float) -> bool:
+    """Keyframe-accurate seek needs a re-encode. A start of 0 can limit frames in place."""
+    return start > 0
+
+
 def detect_scenes(
     video_path: str,
     threshold: float,
     min_scene_len: int,
+    *,
+    frame_skip: int = 0,
+    end_frame: int | None = None,
 ) -> list[int]:
     video = open_video(video_path)
     scene_manager = SceneManager()
@@ -1305,7 +1359,14 @@ def detect_scenes(
             min_scene_len=min_scene_len,
         )
     )
-    scene_manager.detect_scenes(video)
+    if frame_skip > 0:
+        logging.info("Scene detection sampling every %s frames", frame_skip + 1)
+    detect_kwargs: dict[str, Any] = {}
+    if frame_skip > 0:
+        detect_kwargs["frame_skip"] = frame_skip
+    if end_frame is not None:
+        detect_kwargs["end_time"] = end_frame
+    scene_manager.detect_scenes(video, **detect_kwargs)
     scene_list = scene_manager.get_scene_list()
 
     starts = [1]
@@ -1321,6 +1382,8 @@ def resolve_scene_starts(
     min_scene_len: int,
     *,
     continuous: bool,
+    frame_skip: int = 0,
+    end_frame: int | None = None,
 ) -> list[int]:
     """Frame indexes that reset the camera. Frame 1 is always a start.
 
@@ -1329,7 +1392,13 @@ def resolve_scene_starts(
     if continuous:
         logging.info("Continuous clip; skipping scene detection")
         return [1]
-    return detect_scenes(video_path, threshold, min_scene_len)
+    return detect_scenes(
+        video_path,
+        threshold,
+        min_scene_len,
+        frame_skip=frame_skip,
+        end_frame=end_frame,
+    )
 
 
 def mask_stats_from_binary_mask(
@@ -1341,16 +1410,44 @@ def mask_stats_from_binary_mask(
     return float(len(xs)), float(xs.mean()), float(ys.mean()), float(ys.min())
 
 
+def scaled_mask_stats(
+    raw_mask: np.ndarray,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[float, float, float, float]:
+    """Mask moments in frame pixels, without resizing the mask to the frame."""
+    mask_h, mask_w = raw_mask.shape[:2]
+    area, cx, cy, top = mask_stats_from_binary_mask(raw_mask > 0.5)
+    if area <= 0 or mask_w == 0 or mask_h == 0:
+        return area, cx, cy, top
+    scale_x = frame_w / mask_w
+    scale_y = frame_h / mask_h
+    # Pixel-center mapping so a full-res mask and a scaled one share a centroid.
+    return (
+        area * scale_x * scale_y,
+        (cx + 0.5) * scale_x - 0.5,
+        (cy + 0.5) * scale_y - 0.5,
+        top * scale_y,
+    )
+
+
 def extract_saliency_region(
     saliency_map: np.ndarray,
     bounds: tuple[int, int, int, int],
-) -> tuple[float, float, float, float, float] | None:
-    h, w = saliency_map.shape[:2]
+    frame_size: tuple[int, int] | None = None,
+) -> tuple[float, float, float, float, float, float, float] | None:
+    map_h, map_w = saliency_map.shape[:2]
+    if frame_size is None:
+        frame_w, frame_h = map_w, map_h
+    else:
+        frame_w, frame_h = frame_size
+    scale_x = map_w / max(frame_w, 1)
+    scale_y = map_h / max(frame_h, 1)
     x1, y1, x2, y2 = bounds
-    x1 = int(clamp(x1, 0, w - 1))
-    y1 = int(clamp(y1, 0, h - 1))
-    x2 = int(clamp(x2, x1 + 1, w))
-    y2 = int(clamp(y2, y1 + 1, h))
+    x1 = int(clamp(x1 * scale_x, 0, map_w - 1))
+    y1 = int(clamp(y1 * scale_y, 0, map_h - 1))
+    x2 = int(clamp(x2 * scale_x, x1 + 1, map_w))
+    y2 = int(clamp(y2 * scale_y, y1 + 1, map_h))
 
     roi = saliency_map[y1:y2, x1:x2]
     if roi.size == 0:
@@ -1376,12 +1473,12 @@ def extract_saliency_region(
     if weight_sum <= 1e-6:
         return None
 
-    center_x = x1 + float(np.dot(xs, weights) / weight_sum)
-    center_y = y1 + float(np.dot(ys, weights) / weight_sum)
-    left = x1 + float(xs.min())
-    top = y1 + float(ys.min())
-    right = x1 + float(xs.max() + 1)
-    bottom = y1 + float(ys.max() + 1)
+    center_x = (x1 + float(np.dot(xs, weights) / weight_sum)) / scale_x
+    center_y = (y1 + float(np.dot(ys, weights) / weight_sum)) / scale_y
+    left = (x1 + float(xs.min())) / scale_x
+    top = (y1 + float(ys.min())) / scale_y
+    right = (x1 + float(xs.max() + 1)) / scale_x
+    bottom = (y1 + float(ys.max() + 1)) / scale_y
     confidence = clamp(weight_sum / max(1.0, roi.size), 0.0, 1.0)
     return center_x, center_y, left, top, right, bottom, confidence
 
@@ -1460,13 +1557,8 @@ def build_candidates(
             mask_area, mask_cx, mask_cy, mask_top_y = area, cx, cy, y1
             if masks_data is not None and i < len(masks_data):
                 raw_mask = masks_data[i]
-                if raw_mask.shape[:2] != frame.shape[:2]:
-                    raw_mask = cv2.resize(
-                        raw_mask, (w, h), interpolation=cv2.INTER_NEAREST
-                    )
-                binary_mask = (raw_mask > 0.5).astype(np.uint8)
-                mask_area, mask_cx, mask_cy, mask_top_y = mask_stats_from_binary_mask(
-                    binary_mask
+                mask_area, mask_cx, mask_cy, mask_top_y = scaled_mask_stats(
+                    raw_mask, w, h
                 )
                 if mask_area <= 0:
                     mask_area, mask_cx, mask_cy, mask_top_y = area, cx, cy, y1
@@ -1475,7 +1567,9 @@ def build_candidates(
             framing_cy = mask_cy
             salient_box = (
                 extract_saliency_region(
-                    saliency_map, (int(x1), int(y1), int(x2), int(y2))
+                    saliency_map,
+                    (int(x1), int(y1), int(x2), int(y2)),
+                    frame_size=(w, h),
                 )
                 if saliency_map is not None
                 else None
@@ -1486,7 +1580,9 @@ def build_candidates(
             if cls_name == "person":
                 if pose_helper is not None:
                     pose_data = pose_helper.detect_in_person_box(
-                        frame, (int(x1), int(y1), int(x2), int(y2))
+                        frame,
+                        (int(x1), int(y1), int(x2), int(y2)),
+                        track_id=track_id,
                     )
                 face_box = face_helper.detect_in_person_box(
                     frame,
@@ -2577,7 +2673,7 @@ def plan_locked_camera_path(
 def render_locked_frames(
     input_path: Path,
     planned: list[LockedCameraFrame],
-    writer: cv2.VideoWriter,
+    writer: Any,
     debug_writer: cv2.VideoWriter | None,
     args: argparse.Namespace,
     base_crop_w: int,
@@ -2586,16 +2682,28 @@ def render_locked_frames(
     frame_h: int,
     total_frames: int,
     stats: dict[str, int],
+    frames: Any = None,
 ) -> None:
-    cap = cv2.VideoCapture(str(input_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not reopen input video: {input_path}")
+    cap = None
+    frame_iter = None
+    if frames is None:
+        cap = cv2.VideoCapture(str(input_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not reopen input video: {input_path}")
+    else:
+        frame_iter = iter(frames)
 
     frame_idx = 0
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+        if cap is not None:
+            ok, frame = cap.read()
+            if not ok:
+                break
+        else:
+            try:
+                frame = next(frame_iter)
+            except StopIteration:
+                break
         sample = planned[min(frame_idx, len(planned) - 1)]
         crop_w, crop_h = current_crop_size(
             base_crop_w, base_crop_h, sample.zoom, frame_w, frame_h
@@ -2660,7 +2768,8 @@ def render_locked_frames(
                 sample.shot_id,
                 sample.cut,
             )
-    cap.release()
+    if cap is not None:
+        cap.release()
 
 
 def derive_candidate_focus_bounds(
@@ -2839,7 +2948,11 @@ def build_global_saliency_observation(
     min_zoom: float,
     max_zoom: float,
 ) -> CameraObservation | None:
-    region = extract_saliency_region(saliency_map, (0, 0, frame_w, frame_h))
+    region = extract_saliency_region(
+        saliency_map,
+        (0, 0, frame_w, frame_h),
+        frame_size=(frame_w, frame_h),
+    )
     if region is None or region[6] < 0.02:
         return None
     return compute_observation_from_bounds(
@@ -3014,6 +3127,243 @@ def extract_source_clip(
         raise RuntimeError(result.stderr or "Failed to extract source clip")
 
 
+def resolve_video_encoder(video_encoder: str) -> str:
+    encoder = video_encoder or "libx264"
+    if not has_ffmpeg_encoder(encoder):
+        logging.warning("Encoder %s not found, fallback to libx264", encoder)
+        return "libx264"
+    return encoder
+
+
+def encoder_output_args(encoder: str, crf: int, preset: str) -> list[str]:
+    if encoder == "libx264":
+        return ["-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p"]
+    if encoder in {"h264_videotoolbox", "hevc_videotoolbox"}:
+        return ["-pix_fmt", "yuv420p"]
+    if encoder in {"h264_nvenc", "hevc_nvenc"}:
+        nvenc_preset = {
+            "ultrafast": "p1",
+            "superfast": "p2",
+            "veryfast": "p3",
+            "faster": "p3",
+            "fast": "p4",
+            "medium": "p4",
+            "slow": "p5",
+            "slower": "p6",
+            "veryslow": "p7",
+        }.get(preset, "p4")
+        args = [
+            "-preset",
+            nvenc_preset,
+            "-rc",
+            "vbr",
+            "-cq",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+        ]
+        # hev1, the NVIDIA default, does not play in Apple players.
+        if encoder == "hevc_nvenc":
+            args += ["-tag:v", "hvc1"]
+        return args
+    return ["-pix_fmt", "yuv420p"]
+
+
+def build_raw_encode_cmd(
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    audio_source: str,
+    output_path: str,
+    encoder: str,
+    audio_bitrate: str,
+    crf: int,
+    preset: str,
+    vf: str | None,
+) -> list[str]:
+    """One ffmpeg process: raw BGR frames on stdin, source audio, no intermediate file."""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        f"{fps:.6f}",
+        "-i",
+        "pipe:0",
+        "-i",
+        audio_source,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+    ]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd += ["-c:v", encoder]
+    cmd += encoder_output_args(encoder, crf, preset)
+    cmd += [
+        "-c:a",
+        "aac",
+        "-b:a",
+        audio_bitrate,
+        "-shortest",
+        output_path,
+    ]
+    return cmd
+
+
+class FfmpegPipeWriter:
+    """Encode output frames once, muxing source audio in the same process."""
+
+    def __init__(
+        self,
+        final_output_path: Path,
+        width: int,
+        height: int,
+        fps: float,
+        audio_source: Path,
+        video_encoder: str,
+        audio_bitrate: str,
+        crf: int,
+        preset: str,
+        vf: str | None,
+    ) -> None:
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg not found in PATH")
+        self._final = Path(final_output_path)
+        self._temp = self._final.with_name(
+            f"{self._final.stem}_encoding{self._final.suffix or '.mp4'}"
+        )
+        self._temp.unlink(missing_ok=True)
+        self._width = width
+        self._height = height
+        self._released = False
+        encoder = resolve_video_encoder(video_encoder)
+        cmd = build_raw_encode_cmd(
+            width=width,
+            height=height,
+            fps=fps,
+            audio_source=str(audio_source),
+            output_path=str(self._temp),
+            encoder=encoder,
+            audio_bitrate=audio_bitrate,
+            crf=crf,
+            preset=preset,
+            vf=vf,
+        )
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self._stderr = bytearray()
+
+        def _drain() -> None:
+            if self._proc.stderr is None:
+                return
+            self._stderr.extend(self._proc.stderr.read())
+
+        self._drain_thread = threading.Thread(target=_drain, daemon=True)
+        self._drain_thread.start()
+
+    def __del__(self) -> None:
+        try:
+            self.abort()
+        except Exception:
+            return
+
+    def write(self, frame: np.ndarray) -> None:
+        if frame.shape[0] != self._height or frame.shape[1] != self._width:
+            raise RuntimeError(
+                f"Frame is {frame.shape[1]}x{frame.shape[0]}, "
+                f"expected {self._width}x{self._height}"
+            )
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+        if self._proc.stdin is None:
+            raise RuntimeError("ffmpeg encode pipe is closed")
+        try:
+            self._proc.stdin.write(frame.tobytes())
+        except BrokenPipeError as exc:
+            self._drain_thread.join(timeout=2)
+            err = self._stderr.decode(errors="replace").strip()
+            raise RuntimeError(err or "ffmpeg closed the encode pipe") from exc
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
+        self._drain_thread.join()
+        code = self._proc.wait()
+        err = self._stderr.decode(errors="replace").strip()
+        if code != 0:
+            self._temp.unlink(missing_ok=True)
+            raise RuntimeError(err or "ffmpeg encode failed")
+        try:
+            shutil.move(str(self._temp), self._final)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not move rendered video to {self._final}: {exc}"
+            ) from exc
+
+    def abort(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
+        self._proc.kill()
+        self._drain_thread.join(timeout=2)
+        self._proc.wait()
+        self._temp.unlink(missing_ok=True)
+
+
+class RawFrameCache:
+    """Decoded BGR frames for a stride-1 locked render, so the source is not decoded twice."""
+
+    def __init__(self, path: Path, width: int, height: int) -> None:
+        self.path = path
+        self.width = width
+        self.height = height
+        self._file = path.open("wb")
+        self._frame_bytes = width * height * 3
+        self.count = 0
+
+    def write(self, frame: np.ndarray) -> None:
+        if frame.shape[0] != self.height or frame.shape[1] != self.width:
+            raise RuntimeError("cached frame size does not match the source")
+        data = frame if frame.flags["C_CONTIGUOUS"] else np.ascontiguousarray(frame)
+        self._file.write(data.tobytes())
+        self.count += 1
+
+    def close(self) -> None:
+        if not self._file.closed:
+            self._file.close()
+
+    def __iter__(self):
+        self.close()
+        with self.path.open("rb") as handle:
+            while True:
+                raw = handle.read(self._frame_bytes)
+                if len(raw) < self._frame_bytes:
+                    return
+                yield np.frombuffer(raw, dtype=np.uint8).reshape(
+                    self.height, self.width, 3
+                ).copy()
+
+
 def run_ffmpeg_mux(
     silent_video_path: str,
     source_input_path: str,
@@ -3027,10 +3377,7 @@ def run_ffmpeg_mux(
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not found in PATH")
 
-    encoder = video_encoder
-    if encoder and not has_ffmpeg_encoder(encoder):
-        logging.warning("Encoder %s not found, fallback to libx264", encoder)
-        encoder = "libx264"
+    encoder = resolve_video_encoder(video_encoder)
 
     final_path = Path(final_output_path)
     mux_output_path = Path(silent_video_path).with_name(
@@ -3055,12 +3402,7 @@ def run_ffmpeg_mux(
         cmd += ["-vf", vf]
 
     cmd += ["-c:v", encoder]
-
-    if encoder == "libx264":
-        cmd += ["-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p"]
-    elif encoder in {"h264_videotoolbox", "hevc_videotoolbox"}:
-        cmd += ["-pix_fmt", "yuv420p"]
-
+    cmd += encoder_output_args(encoder, crf, preset)
     cmd += [
         "-c:a",
         "aac",
@@ -3148,12 +3490,13 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
     yolo_device = args.device or None
     logging.info(
         "Speed: model=%s imgsz=%s stride=%s face_stride=%s pose=%s "
-        "saliency=%s masks=%s device=%s continuous=%s",
+        "pose_stride=%s saliency=%s masks=%s device=%s continuous=%s",
         args.seg_model,
         args.imgsz,
         args.analyze_stride if args.camera_mode == "locked" else 1,
         args.face_stride,
         not args.skip_pose,
+        args.pose_stride,
         args.saliency_model,
         args.retina_masks,
         yolo_device or "auto",
@@ -3166,7 +3509,9 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
         model.predictor = None
     class_names = model.names
     face_helper = MediaPipeFaceHelper(stride=args.face_stride)
-    pose_helper = None if args.skip_pose else MediaPipePoseHelper()
+    pose_helper = (
+        None if args.skip_pose else MediaPipePoseHelper(stride=args.pose_stride)
+    )
     saliency_helper = build_saliency_helper(args)
     ranking_model = SubjectRankingModel()
     if pose_helper is not None and pose_helper.detector is None:
@@ -3175,7 +3520,16 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         source_path = input_path
-        if start > 0 or duration is not None:
+        timings = {
+            "clip": 0.0,
+            "scene": 0.0,
+            "track": 0.0,
+            "saliency": 0.0,
+            "candidates": 0.0,
+            "encode": 0.0,
+        }
+        clip_started = time.perf_counter()
+        if should_extract_source_clip(start):
             source_path = tmpdir_path / "source_clip.mp4"
             logging.info(
                 "Clipping source start=%.2fs duration=%s",
@@ -3197,6 +3551,7 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                 if total_frames > 0:
                     max_process_frames = min(max_process_frames, total_frames)
                 total_frames = max_process_frames
+        timings["clip"] = time.perf_counter() - clip_started
         if duration is not None:
             logging.info(
                 "Processing %.2fs (%s frames) from %.2fs",
@@ -3205,26 +3560,32 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                 start,
             )
 
+        scene_started = time.perf_counter()
         scene_start_frames = resolve_scene_starts(
             str(source_path),
             args.scene_threshold,
             args.min_scene_len,
             continuous=args.continuous,
+            frame_skip=scene_frame_skip(fps),
+            end_frame=max_process_frames,
         )
+        timings["scene"] = time.perf_counter() - scene_started
         scene_start_set = set(scene_start_frames)
 
-        silent_video_path = tmpdir_path / "silent_vertical.mp4"
         debug_video_path = tmpdir_path / "debug_vertical.mp4"
-
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(
-            str(silent_video_path),
-            fourcc,
-            fps,
-            (args.output_width, args.output_height),
+        writer: FfmpegPipeWriter | None = FfmpegPipeWriter(
+            final_output_path=output_path,
+            width=args.output_width,
+            height=args.output_height,
+            fps=fps,
+            audio_source=source_path,
+            video_encoder=args.video_encoder,
+            audio_bitrate=args.audio_bitrate,
+            crf=args.crf,
+            preset=args.preset_ffmpeg,
+            vf=build_video_filters(post_restore=args.post_restore),
         )
-        if not writer.isOpened():
-            raise RuntimeError("Could not create temporary output video")
 
         debug_writer = None
         final_debug_path = None
@@ -3267,6 +3628,15 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
         locked_plan_info = {"shots": 0, "cuts": 0, "seats": 0, "two_shots": 0}
 
         analyze_stride = args.analyze_stride if args.camera_mode == "locked" else 1
+        locked_frames: RawFrameCache | None = None
+        if args.camera_mode == "locked" and analyze_stride == 1:
+            locked_frames = RawFrameCache(
+                tmpdir_path / "locked_frames.bgr",
+                frame_w,
+                frame_h,
+            )
+            logging.info("Locked stride 1; reusing decoded frames for the render")
+        track_started = time.perf_counter()
         results = model.track(
             source=str(source_path),
             stream=True,
@@ -3306,11 +3676,16 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                     hard_cut=args.camera_mode == "follow",
                 )
                 face_helper.reset_cache()
+                if pose_helper is not None:
+                    pose_helper.reset_cache()
                 saliency_helper.reset_temporal_state()
                 stats["scene_resets"] += 1
                 last_subject_key = None
 
+            saliency_started = time.perf_counter()
             saliency_map = saliency_helper.compute_map(frame)
+            timings["saliency"] += time.perf_counter() - saliency_started
+            candidates_started = time.perf_counter()
             candidates = build_candidates(
                 result=result,
                 frame=frame,
@@ -3325,6 +3700,7 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                 frame_idx=frame_idx,
                 speaker_segments=(speaker_segments if args.speaker_aware_mode else []),
             )
+            timings["candidates"] += time.perf_counter() - candidates_started
 
             ball: Candidate | None = None
             if getattr(args, "sports_action", False):
@@ -3370,6 +3746,8 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                         state.current_scene_index,
                         state.tracked_id,
                     )
+                if locked_frames is not None:
+                    locked_frames.write(frame)
                 continue
 
             if pair is not None:
@@ -3656,26 +4034,14 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                 frame_h,
                 total_frames,
                 stats,
+                frames=None if locked_frames is None else iter(locked_frames),
             )
 
+        timings["track"] = time.perf_counter() - track_started
+        encode_started = time.perf_counter()
         writer.release()
         if debug_writer is not None:
             debug_writer.release()
-
-        vf = build_video_filters(
-            post_restore=args.post_restore,
-        )
-
-        run_ffmpeg_mux(
-            silent_video_path=str(silent_video_path),
-            source_input_path=str(source_path),
-            final_output_path=str(output_path),
-            video_encoder=args.video_encoder,
-            audio_bitrate=args.audio_bitrate,
-            crf=args.crf,
-            preset=args.preset_ffmpeg,
-            vf=vf,
-        )
 
         if debug_writer is not None and final_debug_path is not None:
             run_ffmpeg_mux(
@@ -3688,6 +4054,7 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                 preset=args.preset_ffmpeg,
                 vf=None,
             )
+        timings["encode"] = time.perf_counter() - encode_started
 
         saliency_telemetry = saliency_helper.get_telemetry()
         summary = {
@@ -3713,7 +4080,23 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
             "saliency_frames_backend": saliency_telemetry.get("frames_backend"),
             "saliency_frames_fallback": saliency_telemetry.get("frames_fallback"),
             "saliency_device": saliency_telemetry.get("device"),
+            "timing_clip_s": round(timings["clip"], 3),
+            "timing_scene_s": round(timings["scene"], 3),
+            "timing_track_s": round(timings["track"], 3),
+            "timing_saliency_s": round(timings["saliency"], 3),
+            "timing_candidates_s": round(timings["candidates"], 3),
+            "timing_encode_s": round(timings["encode"], 3),
         }
+        logging.info(
+            "Timing: clip=%.2fs scene=%.2fs track=%.2fs saliency=%.2fs "
+            "candidates=%.2fs encode=%.2fs",
+            timings["clip"],
+            timings["scene"],
+            timings["track"],
+            timings["saliency"],
+            timings["candidates"],
+            timings["encode"],
+        )
         logging.info("Summary: %s", json.dumps(summary, ensure_ascii=False))
         return summary
 

@@ -88,7 +88,7 @@ def reframe_video(
         output_height=output_height,
         save_debug_preview=save_debug_preview,
         debug_path=str(debug) if save_debug_preview else "",
-        video_encoder="libx264",
+        video_encoder="hevc_nvenc",
         device=device(),
         continuous=continuous,
         seg_model=str(weights / SEG_WEIGHTS_NAME),

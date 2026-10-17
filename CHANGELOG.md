@@ -14,8 +14,16 @@ All notable changes to this project are documented in this file. The format is b
 - `--fast`, `--imgsz`, `--analyze-stride`, `--face-stride`, `--device`, and `--saliency-model off`.
 - `--no-two-person-framing` to switch off two-person framing in presets that enable it.
 - `--continuous` (and the matching Cog/Runpod `continuous` input) to skip scene detection on a one-shot clip.
+- `--pose-stride` to reuse pose landmarks for N analyzed frames. The default is every frame.
 
 ### Changed
+- Output frames go straight to one ffmpeg encode with the source audio, instead of an intermediate `mp4v` file and a second encode.
+- A start time of 0 no longer re-encodes the source just to apply `--duration`.
+- Scene detection samples at about 15 fps, and stops at `--duration` instead of scanning the rest of the file.
+- Locked mode with stride 1 renders from the frames already decoded for tracking.
+- Handcrafted saliency and YOLO mask stats stay on their small maps and scale back to the frame.
+- The default encoder is `hevc_nvenc`, for the CLI and for Cog/Runpod. Jobs fall back to `libx264` when ffmpeg does not list it. HEVC output is tagged `hvc1`.
+- YOLO uses CUDA when a GPU is present. Encoding does not.
 - `process_video` returns the summary dict it already logs, and can reuse a loaded YOLO model.
 - The `movie` preset swaps `yolo11n-seg.pt` for `yolo11n.pt` by filename, including absolute paths.
 - `sports` preset follows the ball and the nearest player, with a dead zone, motion lead, and two-person framing on by default; `max_zoom` and step limits are lower.

@@ -116,7 +116,7 @@ def test_zero_duration_reframes_the_whole_clip(monkeypatch, tmp_path: Path) -> N
 
     assert seen == {
         "duration": None,
-        "encoder": "libx264",
+        "encoder": "hevc_nvenc",
         "device": "cpu",
         "continuous": False,
     }
