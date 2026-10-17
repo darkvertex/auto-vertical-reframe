@@ -10,6 +10,7 @@ from verthor.auto_reframe import (
     lerp,
     limit_step,
     process_video,
+    resolve_scene_starts,
 )
 
 
@@ -75,6 +76,32 @@ def test_explicit_saliency_survives_fast() -> None:
     )
     assert args.saliency_model == "handcrafted"
     assert args.skip_saliency is False
+
+
+def test_continuous_defaults_off() -> None:
+    args = build_namespace("in.mp4", "out.mp4")
+    assert args.continuous is False
+
+
+def test_continuous_skips_scene_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = build_namespace("in.mp4", "out.mp4", continuous=True)
+    assert args.continuous is True
+
+    def boom(*_args: object, **_kwargs: object) -> list[int]:
+        raise AssertionError("detect_scenes should not run")
+
+    monkeypatch.setattr("verthor.auto_reframe.detect_scenes", boom)
+    assert resolve_scene_starts("clip.mp4", 3.0, 15, continuous=True) == [1]
+
+
+def test_scene_detection_runs_unless_continuous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "verthor.auto_reframe.detect_scenes",
+        lambda *_args, **_kwargs: [1, 40],
+    )
+    assert resolve_scene_starts("clip.mp4", 3.0, 15, continuous=False) == [1, 40]
 
 
 def test_camera_math_helpers() -> None:

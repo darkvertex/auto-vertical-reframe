@@ -778,6 +778,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--scene-threshold", type=float, default=3.0)
     parser.add_argument("--min-scene-len", type=int, default=15)
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help=("One continuous shot. Skip scene detection and its extra full decode."),
+    )
 
     parser.add_argument(
         "--post-restore",
@@ -885,6 +890,7 @@ def build_namespace(
     video_encoder: str | None = None,
     device: str | None = None,
     seg_model: str | None = None,
+    continuous: bool = False,
     log_level: str = "INFO",
 ) -> argparse.Namespace:
     """Build a preset-applied namespace without reading process arguments."""
@@ -918,6 +924,8 @@ def build_namespace(
         argv += ["--device", device]
     if seg_model:
         argv += ["--seg-model", seg_model]
+    if continuous:
+        argv.append("--continuous")
     return apply_preset(parse_args(argv))
 
 
@@ -1305,6 +1313,23 @@ def detect_scenes(
         start_frame = start_time.get_frames() + 1
         starts.append(start_frame)
     return sorted(set(starts))
+
+
+def resolve_scene_starts(
+    video_path: str,
+    threshold: float,
+    min_scene_len: int,
+    *,
+    continuous: bool,
+) -> list[int]:
+    """Frame indexes that reset the camera. Frame 1 is always a start.
+
+    A continuous clip is one shot, so skip PySceneDetect's full decode.
+    """
+    if continuous:
+        logging.info("Continuous clip; skipping scene detection")
+        return [1]
+    return detect_scenes(video_path, threshold, min_scene_len)
 
 
 def mask_stats_from_binary_mask(
@@ -3123,7 +3148,7 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
     yolo_device = args.device or None
     logging.info(
         "Speed: model=%s imgsz=%s stride=%s face_stride=%s pose=%s "
-        "saliency=%s masks=%s device=%s",
+        "saliency=%s masks=%s device=%s continuous=%s",
         args.seg_model,
         args.imgsz,
         args.analyze_stride if args.camera_mode == "locked" else 1,
@@ -3132,6 +3157,7 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
         args.saliency_model,
         args.retina_masks,
         yolo_device or "auto",
+        args.continuous,
     )
     if model is None:
         model = YOLO(args.seg_model)
@@ -3179,8 +3205,11 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                 start,
             )
 
-        scene_start_frames = detect_scenes(
-            str(source_path), args.scene_threshold, args.min_scene_len
+        scene_start_frames = resolve_scene_starts(
+            str(source_path),
+            args.scene_threshold,
+            args.min_scene_len,
+            continuous=args.continuous,
         )
         scene_start_set = set(scene_start_frames)
 

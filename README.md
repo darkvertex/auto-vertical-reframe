@@ -78,7 +78,7 @@ Set these environment variables on the endpoint so the MP4 is uploaded instead o
 | `BUCKET_ACCESS_KEY_ID` | Access key |
 | `BUCKET_SECRET_ACCESS_KEY` | Secret key |
 
-Input fields match the Replicate model: `video` (http(s) URL or local path), `preset`, `start`, `duration` (`0` reframes the whole clip), `fast`, `saliency_model` (`default`, `handcrafted`, or `off`), `output_width`, `output_height`, and `save_debug_preview`. The result has `video`, a JSON `summary` string, and `debug_video` when the preview was requested. Each value is a presigned URL that lasts 7 days. With no bucket configured, the worker writes the file locally and returns that path, which is how `python handler.py` behaves with `test_input.json`.
+Input fields match the Replicate model: `video` (http(s) URL or local path), `preset`, `start`, `duration` (`0` reframes the whole clip), `fast`, `saliency_model` (`default`, `handcrafted`, or `off`), `output_width`, `output_height`, `save_debug_preview`, and `continuous`. The result has `video`, a JSON `summary` string, and `debug_video` when the preview was requested. Each value is a presigned URL that lasts 7 days. With no bucket configured, the worker writes the file locally and returns that path, which is how `python handler.py` behaves with `test_input.json`.
 
 Send long jobs to `/run` and poll `/status`. Put the same limits on the request so it stays long even if the endpoint setting was left at the default. `ttl` starts when the job is submitted and includes queue time, so it has to cover the wait plus the run. `/runsync` keeps the HTTP connection open and only retains its result for a minute. Async results stay available for 30 minutes after completion, so save the video URL when the job completes.
 
@@ -188,6 +188,7 @@ The whole pipeline lives in `src/verthor/auto_reframe.py`.
 | `--fast` | off | Smaller YOLO input, skip pose, masks, and saliency |
 | `--device` | auto | YOLO inference device (`cpu`, `mps`, `0`, …) |
 | `--scene-threshold` | `3.0` | Scene-cut sensitivity |
+| `--continuous` | off | One shot. Skip scene detection and its extra full decode |
 | `--video-encoder` | `h264_videotoolbox` | ffmpeg encoder; falls back to `libx264` if missing |
 | `--crf` | `18` | Quality for `libx264` |
 | `--post-restore` | off | Light denoise and unsharp pass in ffmpeg |

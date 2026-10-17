@@ -13,6 +13,7 @@ All notable changes to this project are documented in this file. The format is b
 - `--start` / `--duration` to reframe only a window of the source.
 - `--fast`, `--imgsz`, `--analyze-stride`, `--face-stride`, `--device`, and `--saliency-model off`.
 - `--no-two-person-framing` to switch off two-person framing in presets that enable it.
+- `--continuous` (and the matching Cog/Runpod `continuous` input) to skip scene detection on a one-shot clip.
 
 ### Changed
 - `process_video` returns the summary dict it already logs, and can reuse a loaded YOLO model.
