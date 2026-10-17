@@ -38,6 +38,8 @@ from verthor.reframe_job import (  # noqa: E402
 
 EXECUTION_TIMEOUT_MS = 86_400_000
 JOB_TTL_MS = 604_800_000
+# Cloudflare error 1010 rejects urllib's default Python-urllib user agent.
+DOWNLOAD_USER_AGENT = "verthor-worker/1.0"
 
 _MODELS: dict[str, Any] | None = None
 
@@ -126,7 +128,11 @@ def parse_input(data: dict[str, Any]) -> dict[str, Any]:
 def acquire_video(source: str, dest: Path) -> None:
     """Copy a local file or download an http(s) URL into ``dest``."""
     if source.startswith(("http://", "https://")):
-        urllib.request.urlretrieve(source, dest)
+        request = urllib.request.Request(
+            source, headers={"User-Agent": DOWNLOAD_USER_AGENT}
+        )
+        with urllib.request.urlopen(request) as response, dest.open("wb") as out:
+            shutil.copyfileobj(response, out)
         return
     path = Path(source)
     if not path.is_file():

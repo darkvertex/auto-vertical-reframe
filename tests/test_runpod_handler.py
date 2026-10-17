@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import urllib.request
 from pathlib import Path
 
 import pytest
 
 from handler import (
+    DOWNLOAD_USER_AGENT,
     EXECUTION_TIMEOUT_MS,
     JOB_TTL_MS,
+    acquire_video,
     parse_input,
     run_job,
 )
@@ -31,6 +34,31 @@ def test_parse_uses_cog_defaults() -> None:
     assert parsed["output_width"] == 1080
     assert parsed["output_height"] == 1920
     assert parsed["save_debug_preview"] is False
+
+
+def test_http_download_avoids_the_blocked_python_user_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, str] = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            return b""
+
+    def fake_urlopen(request: urllib.request.Request):
+        seen["ua"] = request.get_header("User-agent")
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    acquire_video("https://example.com/clip.mp4", tmp_path / "out.mp4")
+    assert seen["ua"] == DOWNLOAD_USER_AGENT
+    assert "python-urllib" not in seen["ua"].lower()
 
 
 def test_missing_video_is_an_error() -> None:
