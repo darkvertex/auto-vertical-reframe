@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 import urllib.request
 from pathlib import Path
 
@@ -13,7 +15,9 @@ from handler import (
     EXECUTION_TIMEOUT_MS,
     JOB_TTL_MS,
     acquire_video,
+    bucket_object_prefix,
     parse_input,
+    publish_video,
     run_job,
 )
 from verthor.reframe_job import ReframeResult, reframe_video
@@ -59,6 +63,66 @@ def test_http_download_avoids_the_blocked_python_user_agent(
     acquire_video("https://example.com/clip.mp4", tmp_path / "out.mp4")
     assert seen["ua"] == DOWNLOAD_USER_AGENT
     assert "python-urllib" not in seen["ua"].lower()
+
+
+def test_upload_prefix_defaults_to_the_job_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BUCKET_UPLOAD_PREFIX", raising=False)
+    assert bucket_object_prefix("job-1") == "job-1"
+
+
+def test_upload_prefix_uses_the_configured_folder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BUCKET_UPLOAD_PREFIX", "/shows/ep64/")
+    assert bucket_object_prefix("job-1") == "shows/ep64/job-1"
+
+
+def test_upload_prefix_rejects_parent_segments(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUCKET_UPLOAD_PREFIX", "shows/../secret")
+    with pytest.raises(ValueError, match="BUCKET_UPLOAD_PREFIX"):
+        bucket_object_prefix("job-1")
+
+
+def test_bad_upload_prefix_fails_before_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BUCKET_UPLOAD_PREFIX", "..")
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"input")
+
+    result = run_job(
+        {"id": "abc", "input": {"video": str(source)}},
+        models={},
+        publish=_unused,
+    )
+
+    assert result["error"].startswith("BUCKET_UPLOAD_PREFIX")
+
+
+def test_publish_puts_the_folder_ahead_of_the_job_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BUCKET_UPLOAD_PREFIX", "shows/ep64")
+    captured: dict[str, object] = {}
+
+    def upload_file_to_bucket(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "https://example.com/out.mp4"
+
+    module = types.ModuleType("runpod.serverless.utils.rp_upload")
+    module.upload_file_to_bucket = upload_file_to_bucket
+    for name in ("runpod", "runpod.serverless", "runpod.serverless.utils"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "runpod.serverless.utils.rp_upload", module)
+
+    video = tmp_path / "vertical.mp4"
+    video.write_bytes(b"mp4")
+    url = publish_video("job-abcdef12", video)
+
+    assert url == "https://example.com/out.mp4"
+    assert captured["prefix"] == "shows/ep64/job-abcdef12"
+    assert captured["file_name"] == "vertical-job-abcd.mp4"
+    assert captured["file_location"] == str(video)
 
 
 def test_missing_video_is_an_error() -> None:

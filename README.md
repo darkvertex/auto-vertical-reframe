@@ -77,6 +77,7 @@ Set these environment variables on the endpoint so the MP4 is uploaded instead o
 | `BUCKET_ENDPOINT_URL` | S3-compatible endpoint, including the bucket name |
 | `BUCKET_ACCESS_KEY_ID` | Access key |
 | `BUCKET_SECRET_ACCESS_KEY` | Secret key |
+| `BUCKET_UPLOAD_PREFIX` | Optional folder, such as `shows/ep64`. Objects are stored at `{prefix}/{job_id}/…`. Leave unset to use the job id alone |
 
 Input fields match the Replicate model: `video` (http(s) URL or local path), `preset`, `start`, `duration` (`0` reframes the whole clip), `fast`, `saliency_model` (`default`, `handcrafted`, or `off`), `output_width`, `output_height`, and `save_debug_preview`. The result has `video`, a JSON `summary` string, and `debug_video` when the preview was requested. Each value is a presigned URL that lasts 7 days. With no bucket configured, the worker writes the file locally and returns that path, which is how `python handler.py` behaves with `test_input.json`.
 
