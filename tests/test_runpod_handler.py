@@ -92,7 +92,7 @@ def test_missing_local_video_is_an_error() -> None:
 def test_zero_duration_reframes_the_whole_clip(monkeypatch, tmp_path: Path) -> None:
     seen: dict[str, object] = {}
 
-    def fake_process(args, model=None):
+    def fake_process(args, model=None, mic_model=None):
         seen["duration"] = args.duration
         seen["encoder"] = args.video_encoder
         seen["device"] = args.device
