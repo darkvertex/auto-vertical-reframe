@@ -33,7 +33,10 @@ RUN pip install --no-cache-dir -r /tmp/replicate-requirements.txt \
 RUN mkdir -p /src \
     && curl -fsSL -o /src/yolo11n.pt \
         https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt \
-    && test "$(stat -c%s /src/yolo11n.pt)" -gt 5000000
+    && test "$(stat -c%s /src/yolo11n.pt)" -gt 5000000 \
+    && curl -fsSL -o /src/yoloe-11s-seg.pt \
+        https://github.com/ultralytics/assets/releases/download/v8.4.0/yoloe-11s-seg.pt \
+    && test "$(stat -c%s /src/yoloe-11s-seg.pt)" -gt 5000000
 
 WORKDIR /src
 COPY . /src

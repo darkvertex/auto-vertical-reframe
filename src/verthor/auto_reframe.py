@@ -58,6 +58,9 @@ CLASS_IDS = {
 
 BALL_CLASS_NAMES = {"sports ball"}
 VEHICLE_CLASS_NAMES = {"car", "bicycle", "motorcycle", "bus", "truck"}
+MIC_WEIGHTS_NAME = "yoloe-11s-seg.pt"
+MIC_PROMPT_NAME = "microphone_prompt.npz"
+WRIST_REACH_FRACTION = 0.33
 
 PRESETS = {
     "talking_head": {
@@ -113,6 +116,19 @@ PRESETS = {
         "analyze_stride": 2,
         "face_stride": 2,
     },
+    "comedian": {
+        "classes": ["person"],
+        "min_zoom": 1.05,
+        "max_zoom": 1.50,
+        "max_step_x": 9.0,
+        "max_step_y": 6.0,
+        "camera_mode": "follow",
+        "min_subject_hold_frames": 8,
+        "switch_score_threshold": 1.15,
+        "mic_action": True,
+        "mic_grace_sec": 1.0,
+        "mic_conf": 0.15,
+    },
 }
 
 
@@ -153,6 +169,21 @@ class Candidate:
     salient_x2: float | None = None
     salient_y2: float | None = None
     saliency_confidence: float = 0.0
+    left_wrist: tuple[float, float] | None = None
+    right_wrist: tuple[float, float] | None = None
+    mouth_xy: tuple[float, float] | None = None
+    shoulder_cx: float | None = None
+    shoulder_y: float | None = None
+    hip_y: float | None = None
+
+
+@dataclass
+class MicDetection:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    conf: float
 
 
 @dataclass
@@ -187,6 +218,8 @@ class CameraState:
     framing_vx: float = 0.0
     framing_vy: float = 0.0
     force_hard_cut: bool = False
+    mic_holder_keys: list[tuple[int | None, int]] = field(default_factory=list)
+    mic_grace_frames: int = 0
 
 
 CENTER_SEAT = -2
@@ -771,9 +804,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--speaker-json",
         default="",
-        help=(
-            "Optional external diarization JSON for future speaker-aware " "reranking"
-        ),
+        help=("Optional external diarization JSON for future speaker-aware reranking"),
     )
 
     parser.add_argument("--scene-threshold", type=float, default=3.0)
@@ -839,6 +870,9 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     if args.motion_lead_y is None:
         args.motion_lead_y = float(preset.get("motion_lead_y", 0.45))
     args.sports_action = bool(preset.get("sports_action", False))
+    args.mic_action = bool(preset.get("mic_action", False))
+    args.mic_grace_sec = float(preset.get("mic_grace_sec", 1.0))
+    args.mic_conf = float(preset.get("mic_conf", 0.15))
     if args.imgsz is None:
         args.imgsz = int(preset.get("imgsz", 640))
     if args.analyze_stride is None:
@@ -1194,8 +1228,21 @@ class MediaPipePoseHelper:
         mouth_r = visible("mouth_right")
         if mouth_l and mouth_r:
             chin_y = max(mouth_l[1], mouth_r[1])
+            mouth_xy = (
+                (mouth_l[0] + mouth_r[0]) / 2.0,
+                (mouth_l[1] + mouth_r[1]) / 2.0,
+            )
+        elif mouth_l:
+            chin_y = mouth_l[1]
+            mouth_xy = mouth_l
+        elif mouth_r:
+            chin_y = mouth_r[1]
+            mouth_xy = mouth_r
         else:
             chin_y = None
+            mouth_xy = None
+        left_wrist = visible("left_wrist")
+        right_wrist = visible("right_wrist")
 
         left_sh = visible("left_shoulder")
         right_sh = visible("right_shoulder")
@@ -1281,6 +1328,10 @@ class MediaPipePoseHelper:
             "body_cx": body_cx,
             "body_min_x": body_min_x,
             "body_max_x": body_max_x,
+            "left_wrist": left_wrist,
+            "right_wrist": right_wrist,
+            "mouth_xy": mouth_xy,
+            "shoulder_cx": shoulder_cx,
         }
 
 
@@ -1541,6 +1592,12 @@ def build_candidates(
             body_bottom_confident_val = False
             body_min_x_val = None
             body_max_x_val = None
+            left_wrist_val = None
+            right_wrist_val = None
+            mouth_xy_val = None
+            shoulder_cx_val = None
+            shoulder_y_val = None
+            hip_y_val = None
             if pose_data is not None:
                 eye_y_val = pose_data.get("eye_y")
                 chin_y_val = pose_data.get("chin_y")
@@ -1553,6 +1610,12 @@ def build_candidates(
                 )
                 body_min_x_val = pose_data.get("body_min_x")
                 body_max_x_val = pose_data.get("body_max_x")
+                left_wrist_val = pose_data.get("left_wrist")
+                right_wrist_val = pose_data.get("right_wrist")
+                mouth_xy_val = pose_data.get("mouth_xy")
+                shoulder_cx_val = pose_data.get("shoulder_cx")
+                shoulder_y_val = pose_data.get("shoulder_y")
+                hip_y_val = pose_data.get("hip_y")
 
             candidates.append(
                 Candidate(
@@ -1586,6 +1649,12 @@ def build_candidates(
                     body_bottom_confident=body_bottom_confident_val,
                     body_min_x=body_min_x_val,
                     body_max_x=body_max_x_val,
+                    left_wrist=left_wrist_val,
+                    right_wrist=right_wrist_val,
+                    mouth_xy=mouth_xy_val,
+                    shoulder_cx=shoulder_cx_val,
+                    shoulder_y=shoulder_y_val,
+                    hip_y=hip_y_val,
                     salient_x1=(salient_box[2] if salient_box is not None else None),
                     salient_y1=(salient_box[3] if salient_box is not None else None),
                     salient_x2=(salient_box[4] if salient_box is not None else None),
@@ -1740,6 +1809,172 @@ def choose_sports_play(
         else None
     )
     return subject, ball, pair
+
+
+def _person_key(person: Candidate) -> tuple[int | None, int]:
+    return (person.track_id, person.cls_id)
+
+
+def _mic_center(mic: MicDetection) -> tuple[float, float]:
+    return (mic.x1 + mic.x2) / 2.0, (mic.y1 + mic.y2) / 2.0
+
+
+def _wrists(person: Candidate) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    if person.left_wrist is not None:
+        points.append(person.left_wrist)
+    if person.right_wrist is not None:
+        points.append(person.right_wrist)
+    return points
+
+
+def _stand_distance(person: Candidate, mic_cx: float, mic_cy: float) -> float | None:
+    """Distance from a stand mic to the mouth, when the mic is in front of the chest."""
+    if (
+        person.mouth_xy is None
+        or person.shoulder_span is None
+        or person.shoulder_cx is None
+    ):
+        return None
+    half_span = person.shoulder_span / 2.0
+    if abs(mic_cx - person.shoulder_cx) > half_span * 1.05:
+        return None
+    mouth_x, mouth_y = person.mouth_xy
+    top = mouth_y - person.height * 0.08
+    if person.shoulder_y is not None and person.hip_y is not None:
+        bottom = person.shoulder_y + (person.hip_y - person.shoulder_y) * 0.65
+    elif person.shoulder_y is not None:
+        bottom = person.shoulder_y + person.height * 0.25
+    else:
+        bottom = mouth_y + person.height * 0.35
+    if mic_cy < top or mic_cy > bottom:
+        return None
+    return math.hypot(mic_cx - mouth_x, mic_cy - mouth_y)
+
+
+def _body_distance(person: Candidate, mic_cx: float, mic_cy: float) -> float | None:
+    """Upper-body fallback used when pose did not produce wrists or a mouth."""
+    pad_x = person.width * 0.10
+    if mic_cx < person.x1 - pad_x or mic_cx > person.x2 + pad_x:
+        return None
+    if mic_cy < person.y1 or mic_cy > person.y1 + person.height * 0.62:
+        return None
+    if person.face_box is not None:
+        fx1, fy1, fx2, fy2 = person.face_box
+        anchor_x = (fx1 + fx2) / 2.0
+        anchor_y = (fy1 + fy2) / 2.0
+    else:
+        anchor_x = person.framing_cx
+        anchor_y = person.y1 + person.height * 0.25
+    return math.hypot(mic_cx - anchor_x, mic_cy - anchor_y)
+
+
+def claim_mic(person: Candidate, mic: MicDetection) -> tuple[str, float] | None:
+    """Return how this person owns the mic, and the distance, when they do."""
+    mic_cx, mic_cy = _mic_center(mic)
+    reach = WRIST_REACH_FRACTION * max(person.height, 1.0)
+    wrist_hits: list[float] = []
+    for wrist_x, wrist_y in _wrists(person):
+        distance = math.hypot(wrist_x - mic_cx, wrist_y - mic_cy)
+        if distance <= reach:
+            wrist_hits.append(distance)
+    if wrist_hits:
+        return ("wrist", min(wrist_hits))
+    stand = _stand_distance(person, mic_cx, mic_cy)
+    if stand is not None:
+        return ("stand", stand)
+    if not _wrists(person) and person.mouth_xy is None and person.shoulder_span is None:
+        body = _body_distance(person, mic_cx, mic_cy)
+        if body is not None:
+            return ("body", body)
+    return None
+
+
+def assign_mics(
+    people: list[Candidate],
+    mics: list[MicDetection],
+) -> list[Candidate]:
+    """Give each microphone to at most one person. Wrists beat a stand mic."""
+    persons = [person for person in people if person.cls_name == "person"]
+    tiers = {"wrist": 0, "stand": 1, "body": 2}
+    owned: set[int] = set()
+    for mic in mics:
+        claims: list[tuple[int, str, float]] = []
+        for index, person in enumerate(persons):
+            claim = claim_mic(person, mic)
+            if claim is not None:
+                claims.append((index, claim[0], claim[1]))
+        if not claims:
+            continue
+        best_tier = min(tiers[kind] for _, kind, _ in claims)
+        pool = [claim for claim in claims if tiers[claim[1]] == best_tier]
+        owned.add(min(pool, key=lambda claim: claim[2])[0])
+    return sorted(
+        (persons[index] for index in owned), key=lambda person: person.framing_cx
+    )
+
+
+def resolve_mic_holders(
+    candidates: list[Candidate],
+    mics: list[MicDetection],
+    state: CameraState,
+    fps: float,
+    grace_sec: float,
+) -> list[Candidate]:
+    """Hold the last mic owners for about a second after the detector drops them."""
+    holders = assign_mics(candidates, mics)
+    if holders:
+        state.mic_holder_keys = [_person_key(person) for person in holders]
+        state.mic_grace_frames = 0
+        return holders
+    limit = max(1, int(round(float(fps) * float(grace_sec))))
+    if state.mic_holder_keys and state.mic_grace_frames < limit:
+        state.mic_grace_frames += 1
+        keys = set(state.mic_holder_keys)
+        kept = [
+            person
+            for person in candidates
+            if person.cls_name == "person" and _person_key(person) in keys
+        ]
+        if kept:
+            return sorted(kept, key=lambda person: person.framing_cx)
+        return []
+    state.mic_holder_keys = []
+    state.mic_grace_frames = 0
+    return []
+
+
+def _union_bounds(people: list[Candidate]) -> tuple[float, float, float, float]:
+    bounds = [derive_candidate_focus_bounds(person) for person in people]
+    return (
+        min(box[0] for box in bounds),
+        min(box[1] for box in bounds),
+        max(box[2] for box in bounds),
+        max(box[3] for box in bounds),
+    )
+
+
+def _group_fits(people: list[Candidate], max_crop_w: float) -> bool:
+    left, _top, right, _bottom = _union_bounds(people)
+    region_w = max(1.0, right - left)
+    pad = max(region_w * 0.12, 16.0)
+    return region_w + pad * 2.0 <= max_crop_w + 1.0
+
+
+def choose_holder_group(
+    holders: list[Candidate],
+    max_crop_w: float,
+    anchor_x: float,
+) -> list[Candidate]:
+    """Keep every holder that fits. Otherwise drop whoever is farthest from the crop."""
+    chosen = list(holders)
+    while len(chosen) > 1 and not _group_fits(chosen, max_crop_w):
+        farthest = max(
+            chosen,
+            key=lambda person: (abs(person.framing_cx - anchor_x), person.framing_cx),
+        )
+        chosen = [person for person in chosen if person is not farthest]
+    return chosen
 
 
 def union_focus_bounds(
@@ -2805,6 +3040,32 @@ def build_pair_observation(
     )
 
 
+def build_group_observation(
+    people: list[Candidate],
+    base_crop_w: int,
+    base_crop_h: int,
+    frame_w: int,
+    frame_h: int,
+    min_zoom: float,
+    max_zoom: float,
+) -> CameraObservation:
+    confidence = clamp(
+        sum(person.conf for person in people) / len(people),
+        0.25,
+        1.0,
+    )
+    return compute_observation_from_bounds(
+        bounds=_union_bounds(people),
+        confidence=confidence,
+        base_crop_w=base_crop_w,
+        base_crop_h=base_crop_h,
+        frame_w=frame_w,
+        frame_h=frame_h,
+        min_zoom=min_zoom,
+        max_zoom=max_zoom,
+    )
+
+
 def build_global_saliency_observation(
     saliency_map: np.ndarray,
     base_crop_w: int,
@@ -2869,15 +3130,25 @@ def draw_debug(
     state: CameraState,
     frame_idx: int,
     total_frames: int,
+    mics: list[MicDetection] | None = None,
+    holders: list[Candidate] | None = None,
 ) -> np.ndarray:
     dbg = frame.copy()
     left, top, right, bottom = crop_rect
     cv2.rectangle(dbg, (left, top), (right, bottom), (0, 255, 255), 2)
 
-    for candidate in candidates[:6]:
+    holder_ids = {_person_key(person) for person in (holders or [])}
+    if pair is not None:
+        holder_ids.update(_person_key(person) for person in pair)
+    drawn: list[Candidate] = list(candidates[:6])
+    for holder in holders or []:
+        if holder not in drawn:
+            drawn.append(holder)
+
+    for candidate in drawn:
         color = (120, 120, 120)
         thickness = 1
-        if (
+        if _person_key(candidate) in holder_ids or (
             subject is not None
             and candidate.track_id == subject.track_id
             and candidate.cls_id == subject.cls_id
@@ -2895,6 +3166,15 @@ def draw_debug(
             fx1, fy1, fx2, fy2 = candidate.face_box
             cv2.rectangle(dbg, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
 
+    for mic in mics or []:
+        cv2.rectangle(
+            dbg,
+            (int(mic.x1), int(mic.y1)),
+            (int(mic.x2), int(mic.y2)),
+            (0, 165, 255),
+            2,
+        )
+
     if pair is not None:
         for candidate in pair:
             cv2.circle(
@@ -2910,6 +3190,7 @@ def draw_debug(
         f"scene={state.current_scene_index}",
         f"tracked_id={state.tracked_id} cls={state.tracked_cls_id}",
         f"lock_id={state.lock_track_id} zoom={state.zoom:.2f}",
+        f"mics={len(mics or [])} holders={len(holders or [])}",
     ]
     y = 28
     for line in lines:
@@ -3086,9 +3367,89 @@ def reset_for_new_scene(
     state.framing_vx = 0.0
     state.framing_vy = 0.0
     state.force_hard_cut = hard_cut
+    state.mic_holder_keys = []
+    state.mic_grace_frames = 0
 
 
-def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[str, Any]:
+class MicrophoneDetector:
+    """YOLOE microphone boxes for one clip. A failed frame disables the rest of the clip."""
+
+    def __init__(
+        self,
+        model: Any,
+        conf: float,
+        imgsz: int,
+        device: str | None,
+    ) -> None:
+        self.model = model
+        self.conf = conf
+        self.imgsz = imgsz
+        self.device = device
+        self._failed = False
+
+    def detect(self, frame: np.ndarray) -> list[MicDetection]:
+        if self.model is None or self._failed:
+            return []
+        try:
+            results = self.model.predict(
+                frame,
+                conf=self.conf,
+                imgsz=self.imgsz,
+                device=self.device or None,
+                verbose=False,
+            )
+        except Exception as exc:
+            logging.warning(
+                "Microphone detection failed (%s). "
+                "Framing faces for the rest of this clip.",
+                exc,
+            )
+            self._failed = True
+            return []
+        found: list[MicDetection] = []
+        for result in results:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            for box in boxes:
+                x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+                found.append(MicDetection(x1, y1, x2, y2, float(box.conf[0].item())))
+        return found
+
+
+def resolve_mic_weights(seg_model: str) -> str:
+    sibling = Path(seg_model).with_name(MIC_WEIGHTS_NAME)
+    if sibling.is_file() or Path(seg_model).is_file():
+        return str(sibling)
+    return MIC_WEIGHTS_NAME
+
+
+def open_microphone_model(weights: str) -> Any | None:
+    """Load YOLOE and bind the shipped 'microphone' prompt. None if that fails."""
+    prompt = Path(__file__).with_name(MIC_PROMPT_NAME)
+    try:
+        from ultralytics import YOLOE
+
+        model = YOLOE(weights)
+        if prompt.is_file():
+            model.load_prompt_embeddings(prompt)
+        else:
+            model.set_classes(["microphone"])
+        return model
+    except Exception as exc:
+        logging.warning(
+            "Microphone detector unavailable (%s). "
+            "The comedian preset will frame faces until it loads.",
+            exc,
+        )
+        return None
+
+
+def process_video(
+    args: argparse.Namespace,
+    model: Any | None = None,
+    mic_model: Any | None = None,
+) -> dict[str, Any]:
     input_path = Path(args.input)
     output_path = Path(args.output)
     start = max(0.0, float(args.start or 0.0))
@@ -3123,7 +3484,7 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
     yolo_device = args.device or None
     logging.info(
         "Speed: model=%s imgsz=%s stride=%s face_stride=%s pose=%s "
-        "saliency=%s masks=%s device=%s",
+        "saliency=%s masks=%s device=%s mic=%s",
         args.seg_model,
         args.imgsz,
         args.analyze_stride if args.camera_mode == "locked" else 1,
@@ -3132,6 +3493,7 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
         args.saliency_model,
         args.retina_masks,
         yolo_device or "auto",
+        "on" if getattr(args, "mic_action", False) else "off",
     )
     if model is None:
         model = YOLO(args.seg_model)
@@ -3145,6 +3507,19 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
     ranking_model = SubjectRankingModel()
     if pose_helper is not None and pose_helper.detector is None:
         pose_helper = None
+    mic_detector: MicrophoneDetector | None = None
+    if getattr(args, "mic_action", False):
+        if mic_model is None:
+            mic_model = open_microphone_model(resolve_mic_weights(args.seg_model))
+        elif getattr(mic_model, "predictor", None) is not None:
+            mic_model.predictor = None
+        if mic_model is not None:
+            mic_detector = MicrophoneDetector(
+                mic_model,
+                conf=float(getattr(args, "mic_conf", 0.15)),
+                imgsz=int(args.imgsz),
+                device=yolo_device,
+            )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
@@ -3230,6 +3605,7 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
             "frames_with_subject": 0,
             "frames_with_face": 0,
             "frames_with_two_person": 0,
+            "frames_with_mic_holder": 0,
         }
 
         last_subject_key = None
@@ -3298,7 +3674,42 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
             )
 
             ball: Candidate | None = None
-            if getattr(args, "sports_action", False):
+            group: list[Candidate] = []
+            mics: list[MicDetection] = []
+            if getattr(args, "mic_action", False):
+                mics = mic_detector.detect(frame) if mic_detector is not None else []
+                held = resolve_mic_holders(
+                    candidates,
+                    mics,
+                    state,
+                    fps,
+                    float(getattr(args, "mic_grace_sec", 1.0)),
+                )
+                if held:
+                    widest, _crop_h = current_crop_size(
+                        base_crop_w,
+                        base_crop_h,
+                        args.min_zoom,
+                        frame_w,
+                        frame_h,
+                    )
+                    group = choose_holder_group(
+                        held,
+                        float(widest),
+                        state.crop_center_x,
+                    )
+                    subject = group[0] if group else None
+                    pair = None
+                else:
+                    subject = choose_subject(
+                        candidates,
+                        state,
+                        args.lock_first_subject,
+                        args.min_subject_hold_frames,
+                        args.switch_score_threshold,
+                    )
+                    pair = None
+            elif getattr(args, "sports_action", False):
                 subject, ball, pair = choose_sports_play(
                     candidates,
                     state,
@@ -3343,7 +3754,48 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                     )
                 continue
 
-            if pair is not None:
+            if group:
+                stats["frames_with_mic_holder"] += 1
+
+            if len(group) >= 2:
+                group_key = tuple(
+                    sorted((person.track_id, person.cls_id) for person in group)
+                )
+                if last_subject_key is not None and group_key != last_subject_key:
+                    stats["subject_switches"] += 1
+                last_subject_key = group_key
+                stats["frames_with_subject"] += 1
+                stats["frames_with_two_person"] += 1
+                if any(person.face_box is not None for person in group):
+                    stats["frames_with_face"] += 1
+                observation = build_group_observation(
+                    group,
+                    base_crop_w,
+                    base_crop_h,
+                    frame_w,
+                    frame_h,
+                    args.min_zoom,
+                    args.max_zoom,
+                )
+                crop_w, crop_h = apply_camera_motion(
+                    state,
+                    observation,
+                    args,
+                    base_crop_w,
+                    base_crop_h,
+                    frame_w,
+                    frame_h,
+                )
+                state.missed_frames = 0
+                state.tracked_id = None
+                state.tracked_cls_id = None
+                state.frames_since_subject_switch = 0
+                state.last_framing_cx = None
+                state.last_framing_cy = None
+                state.last_subject_key = None
+                state.framing_vx = 0.0
+                state.framing_vy = 0.0
+            elif pair is not None:
                 stats["frames_with_two_person"] += 1
                 observation = build_pair_observation(
                     pair[0],
@@ -3569,6 +4021,8 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                     state,
                     frame_idx,
                     total_frames,
+                    mics=mics,
+                    holders=group,
                 )
                 dbg_out = cv2.resize(
                     dbg,
@@ -3673,6 +4127,7 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
             "frames_with_subject": stats["frames_with_subject"],
             "frames_with_face": stats["frames_with_face"],
             "frames_with_two_person": stats["frames_with_two_person"],
+            "frames_with_mic_holder": stats["frames_with_mic_holder"],
             "subject_switches": stats["subject_switches"],
             "output_width": args.output_width,
             "output_height": args.output_height,

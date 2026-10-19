@@ -22,6 +22,7 @@ def test_talking_head_preset_defaults() -> None:
     assert args.camera_mode == "follow"
     assert args.seg_model == "yolo11n-seg.pt"
     assert args.saliency_model == "handcrafted"
+    assert args.mic_action is False
     assert args.duration is None
     assert args.video_encoder == "h264_videotoolbox"
 
@@ -56,6 +57,27 @@ def test_custom_checkpoint_is_not_swapped() -> None:
         seg_model="custom.pt",
     )
     assert args.seg_model == "custom.pt"
+
+
+def test_comedian_preset_follows_microphone_holders() -> None:
+    args = build_namespace("in.mp4", "out.mp4", preset="comedian")
+    assert args.classes == ["person"]
+    assert args.camera_mode == "follow"
+    assert args.min_zoom == 1.05
+    assert args.max_zoom == 1.50
+    assert args.mic_action is True
+    assert args.mic_grace_sec == 1.0
+    assert args.mic_conf == 0.15
+    assert args.skip_pose is False
+    assert args.saliency_model == "handcrafted"
+    assert args.seg_model == "yolo11n-seg.pt"
+
+
+def test_comedian_fast_keeps_mic_framing_and_skips_pose() -> None:
+    args = build_namespace("in.mp4", "out.mp4", preset="comedian", fast=True)
+    assert args.mic_action is True
+    assert args.skip_pose is True
+    assert args.saliency_model == "off"
 
 
 def test_fast_shrinks_analysis_and_skips_saliency() -> None:

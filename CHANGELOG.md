@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file. The format is b
 ## [Unreleased]
 
 ### Added
+- `comedian` preset. It frames the people holding a microphone, one face when there is a single mic and the whole group when several holders fit in the vertical crop.
 - Runpod Serverless worker (`handler.py`, `Dockerfile`) for queue endpoints. It takes the same inputs as the Cog predictor, uploads the MP4 when bucket credentials are set, and is meant to run with a 24-hour execution timeout and a 7-day job TTL.
 - Cog predictor and `cog.yaml` for [darkvertex/auto-vertical-reframe](https://replicate.com/darkvertex/auto-vertical-reframe). The image bakes YOLO weights and returns the vertical MP4 plus a JSON summary.
 - `uv` project metadata, `uv.lock`, and a dev dependency group.
