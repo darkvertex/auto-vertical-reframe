@@ -795,7 +795,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument("--video-encoder", default="hevc_nvenc")
-    parser.add_argument("--audio-bitrate", default="192k")
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--preset-ffmpeg", default="medium")
 
@@ -3117,9 +3116,7 @@ def extract_source_clip(
         "-pix_fmt",
         "yuv420p",
         "-c:a",
-        "aac",
-        "-b:a",
-        "256k",
+        "copy",
         str(output_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -3177,7 +3174,6 @@ def build_raw_encode_cmd(
     audio_source: str,
     output_path: str,
     encoder: str,
-    audio_bitrate: str,
     crf: int,
     preset: str,
     vf: str | None,
@@ -3212,9 +3208,7 @@ def build_raw_encode_cmd(
     cmd += encoder_output_args(encoder, crf, preset)
     cmd += [
         "-c:a",
-        "aac",
-        "-b:a",
-        audio_bitrate,
+        "copy",
         "-shortest",
         output_path,
     ]
@@ -3232,7 +3226,6 @@ class FfmpegPipeWriter:
         fps: float,
         audio_source: Path,
         video_encoder: str,
-        audio_bitrate: str,
         crf: int,
         preset: str,
         vf: str | None,
@@ -3255,7 +3248,6 @@ class FfmpegPipeWriter:
             audio_source=str(audio_source),
             output_path=str(self._temp),
             encoder=encoder,
-            audio_bitrate=audio_bitrate,
             crf=crf,
             preset=preset,
             vf=vf,
@@ -3369,7 +3361,6 @@ def run_ffmpeg_mux(
     source_input_path: str,
     final_output_path: str,
     video_encoder: str,
-    audio_bitrate: str,
     crf: int,
     preset: str,
     vf: str | None,
@@ -3405,9 +3396,7 @@ def run_ffmpeg_mux(
     cmd += encoder_output_args(encoder, crf, preset)
     cmd += [
         "-c:a",
-        "aac",
-        "-b:a",
-        audio_bitrate,
+        "copy",
         "-shortest",
         str(mux_output_path),
     ]
@@ -3581,7 +3570,6 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
             fps=fps,
             audio_source=source_path,
             video_encoder=args.video_encoder,
-            audio_bitrate=args.audio_bitrate,
             crf=args.crf,
             preset=args.preset_ffmpeg,
             vf=build_video_filters(post_restore=args.post_restore),
@@ -4049,7 +4037,6 @@ def process_video(args: argparse.Namespace, model: Any | None = None) -> dict[st
                 source_input_path=str(source_path),
                 final_output_path=str(final_debug_path),
                 video_encoder=args.video_encoder,
-                audio_bitrate=args.audio_bitrate,
                 crf=args.crf,
                 preset=args.preset_ffmpeg,
                 vf=None,

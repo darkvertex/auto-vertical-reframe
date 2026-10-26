@@ -270,7 +270,6 @@ def test_nvenc_args_and_single_pass_command() -> None:
         audio_source="in.mp4",
         output_path="out.mp4",
         encoder="libx264",
-        audio_bitrate="192k",
         crf=18,
         preset="medium",
         vf=None,
@@ -279,6 +278,7 @@ def test_nvenc_args_and_single_pass_command() -> None:
     assert "pipe:0" in cmd
     assert "1:a?" in cmd
     assert cmd[cmd.index("-c:v") + 1] == "libx264"
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
 
 
 def test_missing_nvenc_falls_back_to_libx264(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -332,7 +332,6 @@ def test_pipe_writer_muxes_one_encode(tmp_path) -> None:
         fps=10,
         audio_source=source,
         video_encoder="libx264",
-        audio_bitrate="64k",
         crf=18,
         preset="ultrafast",
         vf=None,

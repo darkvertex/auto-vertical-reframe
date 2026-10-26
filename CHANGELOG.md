@@ -23,6 +23,7 @@ All notable changes to this project are documented in this file. The format is b
 - Locked mode with stride 1 renders from the frames already decoded for tracking.
 - Handcrafted saliency and YOLO mask stats stay on their small maps and scale back to the frame.
 - The default encoder is `hevc_nvenc`, for the CLI and for Cog/Runpod. Jobs fall back to `libx264` when ffmpeg does not list it. HEVC output is tagged `hvc1`.
+- Source audio is stream-copied (`-c:a copy`) instead of re-encoded to AAC.
 - YOLO uses CUDA when a GPU is present. Encoding does not.
 - `process_video` returns the summary dict it already logs, and can reuse a loaded YOLO model.
 - The `movie` preset swaps `yolo11n-seg.pt` for `yolo11n.pt` by filename, including absolute paths.
