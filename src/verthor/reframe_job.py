@@ -10,7 +10,7 @@ from verthor import auto_reframe as pipeline
 
 SEG_WEIGHTS_NAME = "yolo11n-seg.pt"
 DET_WEIGHTS_NAME = "yolo11n.pt"
-PRESETS = ("talking_head", "sports", "pets", "cars", "movie")
+PRESETS = ("talking_head", "sports", "pets", "cars", "movie", "comedian")
 SALIENCY_MODELS = ("default", "handcrafted", "off")
 MIN_OUTPUT_PX = 16
 MAX_OUTPUT_PX = 3840
@@ -52,6 +52,11 @@ def load_models(directory: Path | None = None) -> dict[str, Any]:
                 f"{DET_WEIGHTS_NAME}; {SEG_WEIGHTS_NAME} ships in the repo."
             )
         models[name] = YOLO(str(path))
+    mic_path = weights / pipeline.MIC_WEIGHTS_NAME
+    if mic_path.is_file():
+        mic_model = pipeline.open_microphone_model(str(mic_path))
+        if mic_model is not None:
+            models[pipeline.MIC_WEIGHTS_NAME] = mic_model
     return models
 
 
@@ -100,7 +105,11 @@ def reframe_video(
             f"Available: {', '.join(sorted(models))}"
         )
 
-    summary = pipeline.process_video(args, model=model)
+    summary = pipeline.process_video(
+        args,
+        model=model,
+        mic_model=models.get(pipeline.MIC_WEIGHTS_NAME),
+    )
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError("Reframe finished without an output video")
 

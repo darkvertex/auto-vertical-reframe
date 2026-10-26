@@ -13,6 +13,7 @@ build:
   # Paths are absolute because WORKDIR is not /src yet.
   run:
     - command: mkdir -p /src && curl -fsSL -o /src/yolo11n.pt https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt && test "$(stat -c%s /src/yolo11n.pt)" -gt 5000000
+    - command: curl -fsSL -o /src/yoloe-11s-seg.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yoloe-11s-seg.pt && test "$(stat -c%s /src/yoloe-11s-seg.pt)" -gt 5000000
     - command: >-
         python -c 'from ultralytics import settings; settings.update({"sync": False}); from ultralytics.utils.checks import check_font; check_font("Arial.ttf")'
 

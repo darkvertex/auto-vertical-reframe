@@ -34,7 +34,7 @@ class Predictor(BasePredictor):
         preset: str = Input(
             description="Framing preset",
             default="talking_head",
-            choices=["talking_head", "sports", "pets", "cars", "movie"],
+            choices=["talking_head", "sports", "pets", "cars", "movie", "comedian"],
         ),
         start: float = Input(
             description="Start time in seconds",

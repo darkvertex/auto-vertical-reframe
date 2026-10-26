@@ -13,6 +13,7 @@ result for a minute.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -40,6 +41,7 @@ EXECUTION_TIMEOUT_MS = 86_400_000
 JOB_TTL_MS = 604_800_000
 # Cloudflare error 1010 rejects urllib's default Python-urllib user agent.
 DOWNLOAD_USER_AGENT = "verthor-worker/1.0"
+_PREFIX_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 _MODELS: dict[str, Any] | None = None
 
@@ -146,6 +148,27 @@ def _safe_job_id(job_id: str) -> str:
     return cleaned or "local"
 
 
+def bucket_object_prefix(job_id: str) -> str:
+    """S3 key prefix: optional ``BUCKET_UPLOAD_PREFIX``, then the job id."""
+    folder = _upload_folder()
+    if not folder:
+        return job_id
+    return f"{folder}/{job_id}"
+
+
+def _upload_folder() -> str:
+    raw = os.environ.get("BUCKET_UPLOAD_PREFIX", "").strip().strip("/")
+    if not raw:
+        return ""
+    parts = raw.split("/")
+    if any(_PREFIX_SEGMENT.fullmatch(part) is None for part in parts):
+        raise ValueError(
+            "BUCKET_UPLOAD_PREFIX must be slash-separated folder names "
+            "using letters, numbers, dots, hyphens, and underscores"
+        )
+    return "/".join(parts)
+
+
 def _suffix_for(source: str) -> str:
     if source.startswith(("http://", "https://")):
         suffix = Path(urlparse(source).path).suffix
@@ -164,7 +187,7 @@ def publish_video(job_id: str, path: Path) -> str:
     return rp_upload.upload_file_to_bucket(
         file_name=file_name,
         file_location=str(path),
-        prefix=job_id,
+        prefix=bucket_object_prefix(job_id),
         extra_args={"ContentType": "video/mp4"},
     )
 
@@ -185,6 +208,11 @@ def run_job(
         return {"error": str(exc)}
 
     job_id = str(job.get("id") or "local")
+    try:
+        bucket_object_prefix(job_id)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     work = Path("/tmp") / f"verthor-{_safe_job_id(job_id)}"
     if work.exists():
         shutil.rmtree(work)

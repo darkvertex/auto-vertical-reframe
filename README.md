@@ -56,7 +56,7 @@ output = replicate.run(
 )
 ```
 
-The image returns the vertical MP4, a JSON summary, and a debug MP4 when `save_debug_preview` is set. Presets match the CLI (`talking_head`, `sports`, `pets`, `cars`, `movie`). `duration` is seconds, and `0` reframes the whole clip. Saliency is `handcrafted` or `off`. DeepGaze is not in the image. YOLO runs on CUDA when a GPU is present, and on CPU otherwise. The default encoder is `hevc_nvenc`. If ffmpeg does not list it, the job falls back to `libx264`.
+The image returns the vertical MP4, a JSON summary, and a debug MP4 when `save_debug_preview` is set. Presets match the CLI (`talking_head`, `sports`, `pets`, `cars`, `movie`, `comedian`). `duration` is seconds, and `0` reframes the whole clip. Saliency is `handcrafted` or `off`. DeepGaze is not in the image. YOLO runs on CUDA when a GPU is present, and on CPU otherwise. The default encoder is `hevc_nvenc`. If ffmpeg does not list it, the job falls back to `libx264`.
 
 Pushes to `main` build and publish that image. The release workflow reads `REPLICATE_CLI_AUTH_TOKEN` from the `production` GitHub Environment. That value is the CLI auth token from [replicate.com/auth/token](https://replicate.com/auth/token), not an `r8_` API token. Pull requests build the image and run a one-second CPU smoke test, and they do not push.
 
@@ -77,6 +77,7 @@ Set these environment variables on the endpoint so the MP4 is uploaded instead o
 | `BUCKET_ENDPOINT_URL` | S3-compatible endpoint, including the bucket name |
 | `BUCKET_ACCESS_KEY_ID` | Access key |
 | `BUCKET_SECRET_ACCESS_KEY` | Secret key |
+| `BUCKET_UPLOAD_PREFIX` | Optional folder, such as `shows/ep64`. Objects are stored at `{prefix}/{job_id}/…`. Leave unset to use the job id alone |
 
 Input fields match the Replicate model: `video` (http(s) URL or local path), `preset`, `start`, `duration` (`0` reframes the whole clip), `fast`, `saliency_model` (`default`, `handcrafted`, or `off`), `output_width`, `output_height`, `save_debug_preview`, and `continuous`. The result has `video`, a JSON `summary` string, and `debug_video` when the preview was requested. Each value is a presigned URL that lasts 7 days. With no bucket configured, the worker writes the file locally and returns that path, which is how `python handler.py` behaves with `test_input.json`.
 
@@ -150,6 +151,16 @@ verthor match.mp4 match_vertical.mp4 --preset sports --save-debug-preview
 
 `--save-debug-preview` writes a second file, `match_vertical_debug.mp4`, showing the crop rectangle, detected subjects, and face boxes on every frame.
 
+## Reframe a comedy set around the microphones
+
+For a club set or a roast. The `comedian` preset frames the people who are holding a microphone and leaves everyone else out. One holder is framed on the face. Several holders share one crop when they fit in the vertical frame. A lineup that is wider than that frame keeps the cluster nearest the current crop.
+
+```bash
+verthor set.mp4 set_vertical.mp4 --preset comedian
+```
+
+The first run downloads `yoloe-11s-seg.pt`. A handheld mic counts when a wrist is on it. A stand mic counts when it sits in front of that person's mouth and chest. A mic left on a stool does not. If the detector loses the mic for about a second, the crop stays on the last holder, then falls back to the highest-ranked face.
+
 ## Reframe a movie scene with locked shots and hard cuts
 
 For cinematic clips, where a panning crop looks wrong. The `movie` preset analyzes the clip first, then locks one static crop per shot and hard-cuts on scene or subject changes. Title cards and wide shots stay centered.
@@ -176,7 +187,7 @@ The whole pipeline lives in `src/verthor/auto_reframe.py`.
 
 | Option | Default | What it does |
 |---|---|---|
-| `--preset` | `talking_head` | Framing preset: `talking_head`, `sports`, `pets`, `cars`, `movie` |
+| `--preset` | `talking_head` | Framing preset: `talking_head`, `sports`, `pets`, `cars`, `movie`, `comedian` |
 | `--start` | `0` | Start time in seconds |
 | `--duration` | whole clip | Only reframe this many seconds |
 | `--output-width` / `--output-height` | `1080` / `1920` | Output resolution |
@@ -205,6 +216,7 @@ Run `verthor --help` for the full list, including motion damping, per-frame step
 | `pets` | dog, cat, person | 1.00–1.55 | follow |
 | `cars` | car, truck, bus, motorcycle, person | 1.00–1.30 | follow |
 | `movie` | person | 1.00 | locked |
+| `comedian` | person holding a microphone | 1.05–1.50 | follow |
 
 ### Environment variables
 
@@ -226,6 +238,7 @@ Run `verthor --help` for the full list, including motion damping, per-frame step
 - Linux is covered by the Replicate image and the CI smoke test. Windows is untested.
 - `movie` holds one static crop per shot, so a subject that walks across the frame can leave it.
 - `sports` rarely switches to the player with the ball once it is tracking someone, and ignores vehicles while any person is in frame.
+- `comedian` needs a visible handheld or stand microphone. A lav or a headset is too small, and after about a second with no mic the crop falls back to the highest-ranked face. A lineup wider than the vertical frame keeps the holders nearest the current crop.
 - `--speaker-json` is a placeholder for future speaker-aware ranking.
 
 <details>
