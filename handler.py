@@ -124,6 +124,7 @@ def parse_input(data: dict[str, Any]) -> dict[str, Any]:
         "save_debug_preview": _as_bool(
             data.get("save_debug_preview", False), "save_debug_preview"
         ),
+        "continuous": _as_bool(data.get("continuous", False), "continuous"),
     }
 
 
@@ -236,6 +237,7 @@ def run_job(
             output_width=request["output_width"],
             output_height=request["output_height"],
             save_debug_preview=request["save_debug_preview"],
+            continuous=request["continuous"],
             output_path=output_path,
             debug_path=debug_path,
         )

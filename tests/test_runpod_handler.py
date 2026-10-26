@@ -38,6 +38,7 @@ def test_parse_uses_cog_defaults() -> None:
     assert parsed["output_width"] == 1080
     assert parsed["output_height"] == 1920
     assert parsed["save_debug_preview"] is False
+    assert parsed["continuous"] is False
 
 
 def test_http_download_avoids_the_blocked_python_user_agent(
@@ -160,6 +161,7 @@ def test_zero_duration_reframes_the_whole_clip(monkeypatch, tmp_path: Path) -> N
         seen["duration"] = args.duration
         seen["encoder"] = args.video_encoder
         seen["device"] = args.device
+        seen["continuous"] = args.continuous
         Path(args.output).write_bytes(b"mp4")
         return {"preset": args.preset, "frames_processed": 1}
 
@@ -176,9 +178,39 @@ def test_zero_duration_reframes_the_whole_clip(monkeypatch, tmp_path: Path) -> N
         debug_path=tmp_path / "debug.mp4",
     )
 
-    assert seen == {"duration": None, "encoder": "libx264", "device": "cpu"}
+    assert seen == {
+        "duration": None,
+        "encoder": "hevc_nvenc",
+        "device": "cpu",
+        "continuous": False,
+    }
     assert result.summary["frames_processed"] == 1
     assert result.debug_video is None
+
+
+def test_continuous_reaches_the_pipeline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_process(args, model=None, mic_model=None):
+        seen["continuous"] = args.continuous
+        Path(args.output).write_bytes(b"mp4")
+        return {"preset": args.preset, "frames_processed": 1}
+
+    monkeypatch.setattr("verthor.reframe_job.pipeline.process_video", fake_process)
+    monkeypatch.setattr("verthor.reframe_job.device", lambda: "cpu")
+    video = tmp_path / "in.mp4"
+    video.write_bytes(b"src")
+
+    reframe_video(
+        {"yolo11n-seg.pt": object()},
+        video,
+        continuous=True,
+        output_path=tmp_path / "out.mp4",
+        debug_path=tmp_path / "debug.mp4",
+    )
+    assert seen["continuous"] is True
 
 
 def test_run_job_publishes_video_and_summary(tmp_path: Path) -> None:
@@ -244,6 +276,39 @@ def test_debug_preview_is_published(tmp_path: Path) -> None:
 
     assert result["debug_video"] == "url:debug.mp4"
     assert names == ["vertical.mp4", "debug.mp4"]
+
+
+def test_continuous_must_be_a_boolean() -> None:
+    result = run_job(
+        {"id": "job-1", "input": {"video": "clip.mp4", "continuous": "yes"}},
+        models={},
+        publish=_unused,
+    )
+    assert result == {"error": "continuous must be a boolean"}
+
+
+def test_continuous_is_passed_to_reframe(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"input")
+    seen: dict[str, object] = {}
+
+    def fake_reframe(models, video_path, **kwargs):
+        seen["continuous"] = kwargs["continuous"]
+        output = Path(kwargs["output_path"])
+        output.write_bytes(b"v")
+        return ReframeResult(
+            video=output,
+            summary={"frames_processed": 1},
+            debug_video=None,
+        )
+
+    run_job(
+        {"id": "abc", "input": {"video": str(source), "continuous": True}},
+        models={},
+        publish=lambda job_id, path: f"url:{path.name}",
+        reframe=fake_reframe,
+    )
+    assert seen["continuous"] is True
 
 
 def test_pipeline_errors_propagate(tmp_path: Path) -> None:

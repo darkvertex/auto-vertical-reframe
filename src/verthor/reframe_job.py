@@ -72,6 +72,7 @@ def reframe_video(
     output_width: int = 1080,
     output_height: int = 1920,
     save_debug_preview: bool = False,
+    continuous: bool = False,
     output_path: str | Path,
     debug_path: str | Path,
 ) -> ReframeResult:
@@ -92,8 +93,9 @@ def reframe_video(
         output_height=output_height,
         save_debug_preview=save_debug_preview,
         debug_path=str(debug) if save_debug_preview else "",
-        video_encoder="libx264",
+        video_encoder="hevc_nvenc",
         device=device(),
+        continuous=continuous,
         seg_model=str(weights / SEG_WEIGHTS_NAME),
     )
     model = models.get(Path(args.seg_model).name)

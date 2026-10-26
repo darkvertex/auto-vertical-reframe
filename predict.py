@@ -74,6 +74,12 @@ class Predictor(BasePredictor):
             description="Also return a preview with the crop and detections drawn",
             default=False,
         ),
+        continuous: bool = Input(
+            description=(
+                "One continuous shot. Skip scene detection and its extra full decode."
+            ),
+            default=False,
+        ),
     ) -> Output:
         """Reframe a horizontal video to vertical 9:16, keeping the subject in frame."""
         suffix = LocalPath(str(video)).suffix or ".mp4"
@@ -93,6 +99,7 @@ class Predictor(BasePredictor):
             output_width=output_width,
             output_height=output_height,
             save_debug_preview=save_debug_preview,
+            continuous=continuous,
             output_path=output_path,
             debug_path=debug_path,
         )
