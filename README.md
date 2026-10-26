@@ -198,6 +198,7 @@ The whole pipeline lives in `src/verthor/auto_reframe.py`.
 | `--two-person-framing` | off (on for `sports`) | Frame two people together; `--no-two-person-framing` disables |
 | `--fast` | off | Smaller YOLO input, skip pose, masks, and saliency |
 | `--device` | auto | YOLO inference device (`cpu`, `mps`, `0`, …) |
+| `--no-half` | off | Keep YOLO in FP32 on CUDA. By default CUDA runs FP16 |
 | `--scene-threshold` | `3.0` | Scene-cut sensitivity. Detection samples at about 15 fps |
 | `--continuous` | off | One shot. Skip scene detection and its extra full decode |
 | `--pose-stride` | `1` | Run pose every N analyzed frames and reuse the last pose |

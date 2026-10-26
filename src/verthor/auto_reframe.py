@@ -634,6 +634,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="YOLO inference device (cpu, mps, 0, ...). Default: auto-select.",
     )
+    parser.add_argument(
+        "--half",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run YOLO in FP16 on CUDA. --no-half keeps FP32.",
+    )
     parser.add_argument("--conf", type=float, default=0.30)
 
     parser.add_argument(
@@ -3855,6 +3861,31 @@ def open_microphone_model(weights: str) -> Any | None:
         return None
 
 
+def yolo_half_precision(device: str | None, enabled: bool = True) -> bool:
+    """FP16 only on CUDA. CPU has no FP16 speedup and MPS support is uneven."""
+    if not enabled or torch is None or not torch.cuda.is_available():
+        return False
+    name = str(device or "").strip().lower()
+    if not name:
+        # Ultralytics picks CUDA itself when it is available.
+        return True
+    if name.startswith("cuda"):
+        return True
+    return all(part.strip().isdigit() for part in name.split(","))
+
+
+def yolo_precision_kwargs(half: bool) -> dict[str, Any]:
+    """FP16 request for model.track. Ultralytics 8.4 replaced ``half`` with
+    ``quantize`` and warns on every call that still passes ``half``."""
+    if not half:
+        return {}
+    from ultralytics.cfg import DEFAULT_CFG_DICT
+
+    if "quantize" in DEFAULT_CFG_DICT:
+        return {"quantize": 16}
+    return {"half": True}
+
+
 def process_video(
     args: argparse.Namespace,
     model: Any | None = None,
@@ -3892,9 +3923,11 @@ def process_video(
     speaker_segments = load_speaker_segments(args.speaker_json)
 
     yolo_device = args.device or None
+    yolo_half = yolo_half_precision(yolo_device, getattr(args, "half", True))
     logging.info(
         "Speed: model=%s imgsz=%s stride=%s face_stride=%s pose=%s "
-        "pose_stride=%s saliency=%s masks=%s device=%s continuous=%s mic=%s",
+        "pose_stride=%s saliency=%s masks=%s device=%s half=%s "
+        "continuous=%s mic=%s",
         args.seg_model,
         args.imgsz,
         args.analyze_stride if args.camera_mode == "locked" else 1,
@@ -3904,6 +3937,7 @@ def process_video(
         args.saliency_model,
         args.retina_masks,
         yolo_device or "auto",
+        yolo_half,
         args.continuous,
         "on" if getattr(args, "mic_action", False) else "off",
     )
@@ -4066,6 +4100,7 @@ def process_video(
             imgsz=args.imgsz,
             vid_stride=analyze_stride,
             device=yolo_device,
+            **yolo_precision_kwargs(yolo_half),
             verbose=False,
         )
 

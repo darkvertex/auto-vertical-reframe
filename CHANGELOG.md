@@ -15,6 +15,7 @@ All notable changes to this project are documented in this file. The format is b
 - `--fast`, `--imgsz`, `--analyze-stride`, `--face-stride`, `--device`, and `--saliency-model off`.
 - `--no-two-person-framing` to switch off two-person framing in presets that enable it.
 - `--continuous` (and the matching Cog/Runpod `continuous` input) to skip scene detection on a one-shot clip.
+- `--no-half` to keep YOLO in FP32. CUDA runs YOLO in FP16 by default.
 - `--pose-stride` to reuse pose landmarks for N analyzed frames. The default is every frame.
 
 ### Fixed

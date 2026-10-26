@@ -13,6 +13,7 @@ import pytest
 from verthor.auto_reframe import (
     FfmpegPipeWriter,
     MediaPipePoseHelper,
+    apply_preset,
     build_namespace,
     build_raw_encode_cmd,
     clamp,
@@ -21,12 +22,15 @@ from verthor.auto_reframe import (
     has_ffmpeg_encoder,
     lerp,
     limit_step,
+    parse_args,
     process_video,
     resolve_scene_starts,
     resolve_video_encoder,
     scaled_mask_stats,
     scene_frame_skip,
     should_extract_source_clip,
+    yolo_half_precision,
+    yolo_precision_kwargs,
 )
 
 
@@ -452,3 +456,47 @@ class _FakeCapture:
 class _FakeModel:
     names: dict[int, str] = {}
     predictor = None
+
+
+@pytest.mark.parametrize(
+    ("device", "cuda", "enabled", "expected"),
+    [
+        (None, True, True, True),
+        ("0", True, True, True),
+        ("0,1", True, True, True),
+        ("cuda:0", True, True, True),
+        ("cpu", True, True, False),
+        ("mps", True, True, False),
+        (None, False, True, False),
+        ("0", False, True, False),
+        ("0", True, False, False),
+    ],
+)
+def test_yolo_half_only_on_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+    device: str | None,
+    cuda: bool,
+    enabled: bool,
+    expected: bool,
+) -> None:
+    fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: cuda))
+    monkeypatch.setattr("verthor.auto_reframe.torch", fake_torch)
+    assert yolo_half_precision(device, enabled) is expected
+
+
+def test_no_half_flag() -> None:
+    assert build_namespace("in.mp4", "out.mp4").half is True
+    args = apply_preset(parse_args(["in.mp4", "out.mp4", "--no-half"]))
+    assert args.half is False
+
+
+def test_fp16_uses_quantize_when_ultralytics_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ultralytics import cfg
+
+    assert yolo_precision_kwargs(False) == {}
+    monkeypatch.setitem(cfg.DEFAULT_CFG_DICT, "quantize", None)
+    assert yolo_precision_kwargs(True) == {"quantize": 16}
+    monkeypatch.delitem(cfg.DEFAULT_CFG_DICT, "quantize")
+    assert yolo_precision_kwargs(True) == {"half": True}
