@@ -17,15 +17,20 @@ All notable changes to this project are documented in this file. The format is b
 - `--continuous` (and the matching Cog/Runpod `continuous` input) to skip scene detection on a one-shot clip.
 - `--pose-stride` to reuse pose landmarks for N analyzed frames. The default is every frame.
 
+### Fixed
+- Encoder fallback tests a one-frame encode instead of reading `ffmpeg -encoders`, which lists `hevc_nvenc` even when the NVENC driver library is missing. Such jobs used to fail at the end; they now use `libx264` from the start.
+- The Runpod image sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video`, so the NVIDIA runtime mounts the NVENC library.
+- macOS uses `h264_videotoolbox` by default again instead of falling back to CPU `libx264`.
+
 ### Changed
 - Output frames go straight to one ffmpeg encode with the source audio, instead of an intermediate `mp4v` file and a second encode.
 - A start time of 0 no longer re-encodes the source just to apply `--duration`.
 - Scene detection samples at about 15 fps, and stops at `--duration` instead of scanning the rest of the file.
 - Locked mode with stride 1 renders from the frames already decoded for tracking.
 - Handcrafted saliency and YOLO mask stats stay on their small maps and scale back to the frame.
-- The default encoder is `hevc_nvenc`, for the CLI and for Cog/Runpod. Jobs fall back to `libx264` when ffmpeg does not list it. HEVC output is tagged `hvc1`.
+- The default encoder is `hevc_nvenc` for Cog/Runpod. The CLI default is `auto`: `h264_videotoolbox` on macOS, `hevc_nvenc` elsewhere. HEVC output is tagged `hvc1`.
 - Source audio is stream-copied (`-c:a copy`) instead of re-encoded to AAC.
-- YOLO uses CUDA when a GPU is present. Encoding does not.
+- YOLO uses CUDA when a GPU is present.
 - `process_video` returns the summary dict it already logs, and can reuse a loaded YOLO model.
 - The `movie` preset swaps `yolo11n-seg.pt` for `yolo11n.pt` by filename, including absolute paths.
 - `sports` preset follows the ball and the nearest player, with a dead zone, motion lead, and two-person framing on by default; `max_zoom` and step limits are lower.

@@ -1,7 +1,10 @@
 # Runpod Serverless worker. Cog builds from cog.yaml and does not read this file.
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
+# The CUDA base image only asks for compute,utility. NVENC needs "video" so the
+# NVIDIA runtime mounts libnvidia-encode into the container.
 ENV DEBIAN_FRONTEND=noninteractive \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/src/src \

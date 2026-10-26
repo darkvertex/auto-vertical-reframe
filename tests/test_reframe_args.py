@@ -18,6 +18,7 @@ from verthor.auto_reframe import (
     clamp,
     encoder_output_args,
     extract_saliency_region,
+    has_ffmpeg_encoder,
     lerp,
     limit_step,
     process_video,
@@ -40,7 +41,7 @@ def test_talking_head_preset_defaults() -> None:
     assert args.saliency_model == "handcrafted"
     assert args.mic_action is False
     assert args.duration is None
-    assert args.video_encoder == "hevc_nvenc"
+    assert args.video_encoder == "auto"
 
 
 def test_movie_preset_swaps_to_detection_checkpoint() -> None:
@@ -312,6 +313,67 @@ def test_missing_nvenc_falls_back_to_libx264(monkeypatch: pytest.MonkeyPatch) ->
     assert resolve_video_encoder("hevc_nvenc") == "libx264"
     monkeypatch.setattr("verthor.auto_reframe.has_ffmpeg_encoder", lambda _name: True)
     assert resolve_video_encoder("h264_nvenc") == "h264_nvenc"
+
+
+@pytest.fixture
+def fake_ffmpeg(monkeypatch: pytest.MonkeyPatch):
+    """Stub the encoder probe: encoders in ``working`` encode, others fail."""
+    working: set[str] = set()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        encoder = cmd[cmd.index("-c:v") + 1]
+        code = 0 if encoder in working else 1
+        return subprocess.CompletedProcess(cmd, code, "", "Cannot load libnvidia")
+
+    monkeypatch.setattr("verthor.auto_reframe.shutil.which", lambda _name: "ffmpeg")
+    monkeypatch.setattr("verthor.auto_reframe.subprocess.run", fake_run)
+    has_ffmpeg_encoder.cache_clear()
+    yield SimpleNamespace(working=working, calls=calls)
+    has_ffmpeg_encoder.cache_clear()
+
+
+def test_listed_but_unloadable_nvenc_falls_back(fake_ffmpeg, monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.sys.platform", "linux")
+    assert resolve_video_encoder("hevc_nvenc") == "libx264"
+    assert resolve_video_encoder("auto") == "libx264"
+    probe = fake_ffmpeg.calls[0]
+    assert probe[probe.index("-f") + 1] == "lavfi"
+    assert probe[-2:] == ["null", "-"]
+
+
+def test_working_nvenc_is_probed_once(fake_ffmpeg, monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.sys.platform", "linux")
+    fake_ffmpeg.working.add("hevc_nvenc")
+    assert resolve_video_encoder("auto") == "hevc_nvenc"
+    assert resolve_video_encoder("hevc_nvenc") == "hevc_nvenc"
+    assert len(fake_ffmpeg.calls) == 1
+
+
+def test_auto_encoder_uses_videotoolbox_on_macos(fake_ffmpeg, monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.sys.platform", "darwin")
+    fake_ffmpeg.working.update({"h264_videotoolbox", "hevc_nvenc"})
+    assert resolve_video_encoder("auto") == "h264_videotoolbox"
+    fake_ffmpeg.working.clear()
+    has_ffmpeg_encoder.cache_clear()
+    assert resolve_video_encoder("auto") == "libx264"
+
+
+def test_explicit_encoder_is_honored(fake_ffmpeg, monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.sys.platform", "darwin")
+    fake_ffmpeg.working.update({"h264_videotoolbox", "hevc_nvenc"})
+    assert resolve_video_encoder("hevc_nvenc") == "hevc_nvenc"
+    assert resolve_video_encoder("libx264") == "libx264"
+
+
+def test_encoder_probe_survives_missing_ffmpeg(monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.shutil.which", lambda _name: None)
+    has_ffmpeg_encoder.cache_clear()
+    try:
+        assert has_ffmpeg_encoder("hevc_nvenc") is False
+    finally:
+        has_ffmpeg_encoder.cache_clear()
 
 
 def test_pipe_writer_muxes_one_encode(tmp_path) -> None:

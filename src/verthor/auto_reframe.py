@@ -7,11 +7,13 @@ import logging
 import math
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -825,7 +827,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Apply light unsharp/denoise during final ffmpeg stage",
     )
 
-    parser.add_argument("--video-encoder", default="hevc_nvenc")
+    parser.add_argument(
+        "--video-encoder",
+        default="auto",
+        help=(
+            "ffmpeg encoder. auto tries hevc_nvenc (h264_videotoolbox on macOS), "
+            "then libx264"
+        ),
+    )
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--preset-ffmpeg", default="medium")
 
@@ -3345,16 +3354,48 @@ def draw_debug(
     return dbg
 
 
+@cache
 def has_ffmpeg_encoder(encoder_name: str) -> bool:
+    """Encode one tiny frame with the encoder.
+
+    ``ffmpeg -encoders`` lists hardware encoders whose driver library is not
+    loadable (apt ffmpeg always lists ``hevc_nvenc``), so only a real encode
+    tells us the job will not fail at the end.
+    """
     if shutil.which("ffmpeg") is None:
         return False
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-encoders"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return encoder_name in result.stdout
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=s=256x256",
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        encoder_name,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logging.debug("Encoder probe for %s failed: %s", encoder_name, exc)
+        return False
+    if result.returncode != 0:
+        logging.debug(
+            "Encoder probe for %s failed: %s", encoder_name, result.stderr.strip()
+        )
+        return False
+    return True
 
 
 def build_video_filters(
@@ -3405,12 +3446,25 @@ def extract_source_clip(
         raise RuntimeError(result.stderr or "Failed to extract source clip")
 
 
+def default_encoder_candidates() -> list[str]:
+    if sys.platform == "darwin":
+        return ["h264_videotoolbox"]
+    return ["hevc_nvenc"]
+
+
 def resolve_video_encoder(video_encoder: str) -> str:
-    encoder = video_encoder or "libx264"
-    if not has_ffmpeg_encoder(encoder):
-        logging.warning("Encoder %s not found, fallback to libx264", encoder)
-        return "libx264"
-    return encoder
+    requested = video_encoder or "auto"
+    if requested == "auto":
+        candidates = default_encoder_candidates()
+    else:
+        candidates = [requested]
+    for encoder in candidates:
+        if encoder == "libx264" or has_ffmpeg_encoder(encoder):
+            logging.info("Video encoder: %s", encoder)
+            return encoder
+        logging.warning("Encoder %s is not usable, fallback to libx264", encoder)
+    logging.info("Video encoder: libx264")
+    return "libx264"
 
 
 def encoder_output_args(encoder: str, crf: int, preset: str) -> list[str]:
