@@ -21,6 +21,7 @@ All notable changes to this project are documented in this file. The format is b
 ### Fixed
 - Encoder fallback tests a one-frame encode instead of reading `ffmpeg -encoders`, which lists `hevc_nvenc` even when the NVENC driver library is missing. Such jobs used to fail at the end; they now use `libx264` from the start.
 - The Runpod image sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video`, so the NVIDIA runtime mounts the NVENC library.
+- The Runpod image keeps protobuf 4.25.9. Installing `runpod` upgraded it to 7.x, which broke MediaPipe, so Runpod jobs ran without face and pose cues.
 - macOS uses `h264_videotoolbox` by default again instead of falling back to CPU `libx264`.
 
 ### Changed

@@ -28,8 +28,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY replicate-requirements.txt /tmp/replicate-requirements.txt
+# runpod pulls fastapi[all], whose OpenTelemetry exporter upgrades protobuf
+# past the <5 that MediaPipe needs; MediaPipe then fails on every frame and
+# no faces are found. Put the pinned protobuf back. runpod does not use it.
 RUN pip install --no-cache-dir -r /tmp/replicate-requirements.txt \
-    && pip install --no-cache-dir "runpod>=1.7.13" "boto3>=1.35"
+    && pip install --no-cache-dir "runpod>=1.7.13" "boto3>=1.35" \
+    && pip install --no-cache-dir --no-deps \
+        "$(grep '^protobuf==' /tmp/replicate-requirements.txt)"
 
 # Detection weights stay cached across code changes. The segmentation
 # checkpoint is copied with the repo. Mirrors the curl in cog.yaml.
