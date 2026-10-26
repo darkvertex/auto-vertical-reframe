@@ -106,7 +106,6 @@ def test_fast_shrinks_analysis_and_skips_saliency() -> None:
     assert args.imgsz <= 512
     assert args.skip_pose is True
     assert args.saliency_model == "off"
-    assert args.retina_masks is False
 
 
 def test_explicit_saliency_survives_fast() -> None:
@@ -249,6 +248,49 @@ def test_mask_stats_scale_to_the_frame() -> None:
     assert cy == pytest.approx(cy_full)
     assert top_full == 0
     assert area_full == 16
+
+
+def _letterboxed(full: np.ndarray, imgsz: int, stride: int = 32) -> np.ndarray:
+    """Resize and pad like ultralytics LetterBox(auto=True) for a stream frame."""
+    frame_h, frame_w = full.shape
+    gain = min(imgsz / frame_h, imgsz / frame_w)
+    new_w, new_h = round(frame_w * gain), round(frame_h * gain)
+    pad_w = (imgsz - new_w) % stride
+    pad_h = (imgsz - new_h) % stride
+    resized = cv2.resize(full, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    top = round(pad_h / 2 - 0.1)
+    left = round(pad_w / 2 - 0.1)
+    return cv2.copyMakeBorder(
+        resized,
+        top,
+        pad_h - top,
+        left,
+        pad_w - left,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("frame_w", "frame_h", "imgsz"),
+    [(1920, 1080, 640), (1280, 720, 512), (1080, 1920, 640), (854, 480, 640)],
+)
+def test_letterboxed_mask_stats_match_full_res(
+    frame_w: int, frame_h: int, imgsz: int
+) -> None:
+    full = np.zeros((frame_h, frame_w), np.float32)
+    # A person-shaped blob off center, so padding errors would shift it.
+    x1, x2 = int(frame_w * 0.62), int(frame_w * 0.81)
+    y1, y2 = int(frame_h * 0.21), int(frame_h * 0.93)
+    full[y1:y2, x1:x2] = 1.0
+    small = _letterboxed(full, imgsz)
+    assert small.shape != full.shape
+    area, cx, cy, top = scaled_mask_stats(small, frame_w, frame_h)
+    area_full, cx_full, cy_full, top_full = scaled_mask_stats(full, frame_w, frame_h)
+    assert cx == pytest.approx(cx_full, abs=1.0)
+    assert cy == pytest.approx(cy_full, abs=1.0)
+    assert top == pytest.approx(top_full, abs=max(1.0, frame_h / small.shape[0]))
+    assert area == pytest.approx(area_full, rel=0.02)
 
 
 def test_pose_stride_reuses_the_last_pose() -> None:

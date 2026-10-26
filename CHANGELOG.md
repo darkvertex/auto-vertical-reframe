@@ -29,6 +29,7 @@ All notable changes to this project are documented in this file. The format is b
 - Scene detection samples at about 15 fps, and stops at `--duration` instead of scanning the rest of the file.
 - Locked mode with stride 1 renders from the frames already decoded for tracking.
 - Handcrafted saliency and YOLO mask stats stay on their small maps and scale back to the frame.
+- YOLO no longer upsamples masks to the frame (`retina_masks`). Mask stats undo the inference letterbox instead, which also fixes slightly shifted mask centroids in `--fast` mode.
 - The default encoder is `hevc_nvenc` for Cog/Runpod. The CLI default is `auto`: `h264_videotoolbox` on macOS, `hevc_nvenc` elsewhere. HEVC output is tagged `hvc1`.
 - Source audio is stream-copied (`-c:a copy`) instead of re-encoded to AAC.
 - YOLO uses CUDA when a GPU is present.

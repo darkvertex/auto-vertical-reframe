@@ -920,7 +920,6 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     args.pose_stride = max(1, int(args.pose_stride))
     args.skip_saliency = args.saliency_model == "off"
     args.skip_pose = args.camera_mode == "locked" or args.fast
-    args.retina_masks = args.camera_mode != "locked" and not args.fast
     # Match on the filename so an absolute baked path still swaps to the
     # detection checkpoint that lives beside it.
     if args.camera_mode == "locked" and Path(args.seg_model).name == "yolo11n-seg.pt":
@@ -1475,6 +1474,25 @@ def mask_stats_from_binary_mask(
     return float(len(xs)), float(xs.mean()), float(ys.mean()), float(ys.min())
 
 
+def letterbox_gain_pad(
+    mask_w: int,
+    mask_h: int,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[float, float, float, float]:
+    """Gain and padding of a centered letterbox, as in ultralytics scale_boxes.
+
+    Non-retina YOLO masks are at the padded inference size (e.g. 640x384 for a
+    1080p frame at imgsz 640), not at the frame's aspect ratio.
+    """
+    gain = min(mask_h / frame_h, mask_w / frame_w)
+    new_h, new_w = round(frame_h * gain), round(frame_w * gain)
+    gain_x, gain_y = new_w / frame_w, new_h / frame_h
+    pad_x = round((mask_w - new_w) / 2 - 0.1)
+    pad_y = round((mask_h - new_h) / 2 - 0.1)
+    return gain_x, gain_y, float(pad_x), float(pad_y)
+
+
 def scaled_mask_stats(
     raw_mask: np.ndarray,
     frame_w: int,
@@ -1485,14 +1503,13 @@ def scaled_mask_stats(
     area, cx, cy, top = mask_stats_from_binary_mask(raw_mask > 0.5)
     if area <= 0 or mask_w == 0 or mask_h == 0:
         return area, cx, cy, top
-    scale_x = frame_w / mask_w
-    scale_y = frame_h / mask_h
+    gain_x, gain_y, pad_x, pad_y = letterbox_gain_pad(mask_w, mask_h, frame_w, frame_h)
     # Pixel-center mapping so a full-res mask and a scaled one share a centroid.
     return (
-        area * scale_x * scale_y,
-        (cx + 0.5) * scale_x - 0.5,
-        (cy + 0.5) * scale_y - 0.5,
-        top * scale_y,
+        area / (gain_x * gain_y),
+        clamp((cx + 0.5 - pad_x) / gain_x - 0.5, 0.0, frame_w - 1.0),
+        clamp((cy + 0.5 - pad_y) / gain_y - 0.5, 0.0, frame_h - 1.0),
+        clamp((top - pad_y) / gain_y, 0.0, frame_h - 1.0),
     )
 
 
@@ -3926,7 +3943,7 @@ def process_video(
     yolo_half = yolo_half_precision(yolo_device, getattr(args, "half", True))
     logging.info(
         "Speed: model=%s imgsz=%s stride=%s face_stride=%s pose=%s "
-        "pose_stride=%s saliency=%s masks=%s device=%s half=%s "
+        "pose_stride=%s saliency=%s device=%s half=%s "
         "continuous=%s mic=%s",
         args.seg_model,
         args.imgsz,
@@ -3935,7 +3952,6 @@ def process_video(
         not args.skip_pose,
         args.pose_stride,
         args.saliency_model,
-        args.retina_masks,
         yolo_device or "auto",
         yolo_half,
         args.continuous,
@@ -4096,7 +4112,8 @@ def process_video(
             tracker=args.tracker,
             classes=allowed_class_ids,
             conf=args.conf,
-            retina_masks=args.retina_masks,
+            # Inference-size masks; scaled_mask_stats undoes the letterbox.
+            retina_masks=False,
             imgsz=args.imgsz,
             vid_stride=analyze_stride,
             device=yolo_device,
