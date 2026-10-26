@@ -32,6 +32,7 @@ All notable changes to this project are documented in this file. The format is b
 - Handcrafted saliency and YOLO mask stats stay on their small maps and scale back to the frame.
 - YOLO no longer upsamples masks to the frame (`retina_masks`). Mask stats undo the inference letterbox instead, which also fixes slightly shifted mask centroids in `--fast` mode.
 - The default encoder is `hevc_nvenc` for Cog/Runpod. The CLI default is `auto`: `h264_videotoolbox` on macOS, `hevc_nvenc` elsewhere. HEVC output is tagged `hvc1`.
+- YOLO tracking runs on a worker thread up to two frames ahead, so inference overlaps the per-frame CPU work. The summary adds `timing_yolo_wait_s`, the time the loop spent waiting for YOLO.
 - Source audio is stream-copied (`-c:a copy`) instead of re-encoded to AAC.
 - YOLO uses CUDA when a GPU is present.
 - `process_video` returns the summary dict it already logs, and can reuse a loaded YOLO model.

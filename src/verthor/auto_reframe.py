@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import math
+import queue
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,8 @@ import tempfile
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
@@ -3878,6 +3881,83 @@ def open_microphone_model(weights: str) -> Any | None:
         return None
 
 
+class PrefetchIterator:
+    """Drain an iterator on a worker thread, a few items ahead of the consumer.
+
+    One thread pulls items in order, so stateful producers such as
+    ``model.track(persist=True)`` see the same call sequence. Producer errors
+    are re-raised by ``__next__``. ``close`` stops the worker and closes the
+    source iterator on the worker thread, which is the thread running it.
+    """
+
+    _ITEM, _ERROR, _END = range(3)
+
+    def __init__(self, source: Iterable[Any], maxsize: int = 2) -> None:
+        self._queue: queue.Queue[tuple[int, Any]] = queue.Queue(maxsize=maxsize)
+        self._stop = threading.Event()
+        self._finished = False
+        self.wait_s = 0.0
+        self._thread = threading.Thread(
+            target=self._run, args=(iter(source),), name="prefetch", daemon=True
+        )
+        self._thread.start()
+
+    def _put(self, item: tuple[int, Any]) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self, source: Iterator[Any]) -> None:
+        try:
+            for item in source:
+                if not self._put((self._ITEM, item)):
+                    break
+        except BaseException as exc:
+            self._put((self._ERROR, exc))
+        finally:
+            close = getattr(source, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as exc:
+                    logging.debug("Closing the prefetched source failed: %s", exc)
+            self._put((self._END, None))
+
+    def __iter__(self) -> PrefetchIterator:
+        return self
+
+    def __next__(self) -> Any:
+        if self._finished:
+            raise StopIteration
+        started = time.perf_counter()
+        kind, payload = self._queue.get()
+        self.wait_s += time.perf_counter() - started
+        if kind == self._ITEM:
+            return payload
+        self._finished = True
+        self._thread.join()
+        if kind == self._ERROR:
+            raise payload
+        raise StopIteration
+
+    def close(self, timeout: float = 30.0) -> None:
+        self._finished = True
+        self._stop.set()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            logging.warning("Prefetch thread did not stop within %.0fs", timeout)
+
+    def __enter__(self) -> PrefetchIterator:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
 def yolo_half_precision(device: str | None, enabled: bool = True) -> bool:
     """FP16 only on CUDA. CPU has no FP16 speedup and MPS support is uneven."""
     if not enabled or torch is None or not torch.cuda.is_available():
@@ -3985,7 +4065,7 @@ def process_video(
                 device=yolo_device,
             )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, ExitStack() as cleanup:
         tmpdir_path = Path(tmpdir)
         source_path = input_path
         timings = {
@@ -3994,6 +4074,7 @@ def process_video(
             "track": 0.0,
             "saliency": 0.0,
             "candidates": 0.0,
+            "yolo_wait": 0.0,
             "encode": 0.0,
         }
         clip_started = time.perf_counter()
@@ -4105,21 +4186,27 @@ def process_video(
             )
             logging.info("Locked stride 1; reusing decoded frames for the render")
         track_started = time.perf_counter()
-        results = model.track(
-            source=str(source_path),
-            stream=True,
-            persist=True,
-            tracker=args.tracker,
-            classes=allowed_class_ids,
-            conf=args.conf,
-            # Inference-size masks; scaled_mask_stats undoes the letterbox.
-            retina_masks=False,
-            imgsz=args.imgsz,
-            vid_stride=analyze_stride,
-            device=yolo_device,
-            **yolo_precision_kwargs(yolo_half),
-            verbose=False,
+        # Inference for the next frames runs while this thread does the CPU
+        # work (saliency, face, pose, crop, encode) for the current one.
+        results = PrefetchIterator(
+            model.track(
+                source=str(source_path),
+                stream=True,
+                persist=True,
+                tracker=args.tracker,
+                classes=allowed_class_ids,
+                conf=args.conf,
+                # Inference-size masks; scaled_mask_stats undoes the letterbox.
+                retina_masks=False,
+                imgsz=args.imgsz,
+                vid_stride=analyze_stride,
+                device=yolo_device,
+                **yolo_precision_kwargs(yolo_half),
+                verbose=False,
+            ),
+            maxsize=2,
         )
+        cleanup.enter_context(results)
 
         for result_idx, result in enumerate(results, start=1):
             frame = result.orig_img
@@ -4547,6 +4634,9 @@ def process_video(
                     saliency_telemetry.get("requested_backend"),
                 )
 
+        # Stop inference now if the loop ended early at max_process_frames.
+        results.close()
+
         if args.camera_mode == "locked":
             if not locked_intents:
                 raise RuntimeError("Locked camera mode produced no frame plan")
@@ -4586,6 +4676,7 @@ def process_video(
             )
 
         timings["track"] = time.perf_counter() - track_started
+        timings["yolo_wait"] = results.wait_s
         encode_started = time.perf_counter()
         writer.release()
         if debug_writer is not None:
@@ -4633,16 +4724,18 @@ def process_video(
             "timing_track_s": round(timings["track"], 3),
             "timing_saliency_s": round(timings["saliency"], 3),
             "timing_candidates_s": round(timings["candidates"], 3),
+            "timing_yolo_wait_s": round(timings["yolo_wait"], 3),
             "timing_encode_s": round(timings["encode"], 3),
         }
         logging.info(
             "Timing: clip=%.2fs scene=%.2fs track=%.2fs saliency=%.2fs "
-            "candidates=%.2fs encode=%.2fs",
+            "candidates=%.2fs yolo_wait=%.2fs encode=%.2fs",
             timings["clip"],
             timings["scene"],
             timings["track"],
             timings["saliency"],
             timings["candidates"],
+            timings["yolo_wait"],
             timings["encode"],
         )
         logging.info("Summary: %s", json.dumps(summary, ensure_ascii=False))

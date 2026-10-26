@@ -13,6 +13,7 @@ import pytest
 from verthor.auto_reframe import (
     FfmpegPipeWriter,
     MediaPipePoseHelper,
+    PrefetchIterator,
     apply_preset,
     build_namespace,
     build_raw_encode_cmd,
@@ -542,3 +543,58 @@ def test_fp16_uses_quantize_when_ultralytics_has_it(
     assert yolo_precision_kwargs(True) == {"quantize": 16}
     monkeypatch.delitem(cfg.DEFAULT_CFG_DICT, "quantize")
     assert yolo_precision_kwargs(True) == {"half": True}
+
+
+def test_prefetch_keeps_order() -> None:
+    with PrefetchIterator(iter(range(50)), maxsize=2) as items:
+        assert list(items) == list(range(50))
+
+
+def test_prefetch_reraises_producer_errors() -> None:
+    def source():
+        yield 1
+        yield 2
+        raise ValueError("decode failed")
+
+    items = PrefetchIterator(source(), maxsize=2)
+    assert next(items) == 1
+    assert next(items) == 2
+    with pytest.raises(ValueError, match="decode failed"):
+        next(items)
+    with pytest.raises(StopIteration):
+        next(items)
+    items.close()
+
+
+def test_prefetch_close_stops_and_closes_source() -> None:
+    import threading
+
+    produced: list[int] = []
+    closed = threading.Event()
+
+    def source():
+        try:
+            for i in range(1_000_000):
+                produced.append(i)
+                yield i
+        finally:
+            closed.set()
+
+    items = PrefetchIterator(source(), maxsize=2)
+    for i in items:
+        if i == 3:
+            break
+    items.close(timeout=5)
+    assert not items._thread.is_alive()
+    assert closed.is_set()
+    # Bounded queue: the producer ran at most a few items ahead.
+    assert len(produced) <= 4 + 3
+    with pytest.raises(StopIteration):
+        next(items)
+
+
+def test_prefetch_close_while_producer_blocks_on_full_queue() -> None:
+    items = PrefetchIterator(iter(range(100)), maxsize=1)
+    assert next(items) == 0
+    items.close(timeout=5)
+    assert not items._thread.is_alive()
