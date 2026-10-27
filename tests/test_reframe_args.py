@@ -13,19 +13,25 @@ import pytest
 from verthor.auto_reframe import (
     FfmpegPipeWriter,
     MediaPipePoseHelper,
+    PrefetchIterator,
+    apply_preset,
     build_namespace,
     build_raw_encode_cmd,
     clamp,
     encoder_output_args,
     extract_saliency_region,
+    has_ffmpeg_encoder,
     lerp,
     limit_step,
+    parse_args,
     process_video,
     resolve_scene_starts,
     resolve_video_encoder,
     scaled_mask_stats,
     scene_frame_skip,
     should_extract_source_clip,
+    yolo_half_precision,
+    yolo_precision_kwargs,
 )
 
 
@@ -40,7 +46,7 @@ def test_talking_head_preset_defaults() -> None:
     assert args.saliency_model == "handcrafted"
     assert args.mic_action is False
     assert args.duration is None
-    assert args.video_encoder == "hevc_nvenc"
+    assert args.video_encoder == "auto"
 
 
 def test_movie_preset_swaps_to_detection_checkpoint() -> None:
@@ -101,7 +107,6 @@ def test_fast_shrinks_analysis_and_skips_saliency() -> None:
     assert args.imgsz <= 512
     assert args.skip_pose is True
     assert args.saliency_model == "off"
-    assert args.retina_masks is False
 
 
 def test_explicit_saliency_survives_fast() -> None:
@@ -156,8 +161,10 @@ def test_non_positive_duration_is_rejected_before_opening_video() -> None:
         process_video(args)
 
 
-def test_pose_stride_defaults_to_every_frame() -> None:
+def test_pose_stride_defaults_to_every_other_frame() -> None:
     args = build_namespace("in.mp4", "out.mp4")
+    assert args.pose_stride == 2
+    args = apply_preset(parse_args(["in.mp4", "out.mp4", "--pose-stride", "1"]))
     assert args.pose_stride == 1
 
 
@@ -246,6 +253,49 @@ def test_mask_stats_scale_to_the_frame() -> None:
     assert area_full == 16
 
 
+def _letterboxed(full: np.ndarray, imgsz: int, stride: int = 32) -> np.ndarray:
+    """Resize and pad like ultralytics LetterBox(auto=True) for a stream frame."""
+    frame_h, frame_w = full.shape
+    gain = min(imgsz / frame_h, imgsz / frame_w)
+    new_w, new_h = round(frame_w * gain), round(frame_h * gain)
+    pad_w = (imgsz - new_w) % stride
+    pad_h = (imgsz - new_h) % stride
+    resized = cv2.resize(full, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    top = round(pad_h / 2 - 0.1)
+    left = round(pad_w / 2 - 0.1)
+    return cv2.copyMakeBorder(
+        resized,
+        top,
+        pad_h - top,
+        left,
+        pad_w - left,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("frame_w", "frame_h", "imgsz"),
+    [(1920, 1080, 640), (1280, 720, 512), (1080, 1920, 640), (854, 480, 640)],
+)
+def test_letterboxed_mask_stats_match_full_res(
+    frame_w: int, frame_h: int, imgsz: int
+) -> None:
+    full = np.zeros((frame_h, frame_w), np.float32)
+    # A person-shaped blob off center, so padding errors would shift it.
+    x1, x2 = int(frame_w * 0.62), int(frame_w * 0.81)
+    y1, y2 = int(frame_h * 0.21), int(frame_h * 0.93)
+    full[y1:y2, x1:x2] = 1.0
+    small = _letterboxed(full, imgsz)
+    assert small.shape != full.shape
+    area, cx, cy, top = scaled_mask_stats(small, frame_w, frame_h)
+    area_full, cx_full, cy_full, top_full = scaled_mask_stats(full, frame_w, frame_h)
+    assert cx == pytest.approx(cx_full, abs=1.0)
+    assert cy == pytest.approx(cy_full, abs=1.0)
+    assert top == pytest.approx(top_full, abs=max(1.0, frame_h / small.shape[0]))
+    assert area == pytest.approx(area_full, rel=0.02)
+
+
 def test_pose_stride_reuses_the_last_pose() -> None:
     helper = MediaPipePoseHelper(stride=2)
     if helper.detector is None:
@@ -312,6 +362,67 @@ def test_missing_nvenc_falls_back_to_libx264(monkeypatch: pytest.MonkeyPatch) ->
     assert resolve_video_encoder("hevc_nvenc") == "libx264"
     monkeypatch.setattr("verthor.auto_reframe.has_ffmpeg_encoder", lambda _name: True)
     assert resolve_video_encoder("h264_nvenc") == "h264_nvenc"
+
+
+@pytest.fixture
+def fake_ffmpeg(monkeypatch: pytest.MonkeyPatch):
+    """Stub the encoder probe: encoders in ``working`` encode, others fail."""
+    working: set[str] = set()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        encoder = cmd[cmd.index("-c:v") + 1]
+        code = 0 if encoder in working else 1
+        return subprocess.CompletedProcess(cmd, code, "", "Cannot load libnvidia")
+
+    monkeypatch.setattr("verthor.auto_reframe.shutil.which", lambda _name: "ffmpeg")
+    monkeypatch.setattr("verthor.auto_reframe.subprocess.run", fake_run)
+    has_ffmpeg_encoder.cache_clear()
+    yield SimpleNamespace(working=working, calls=calls)
+    has_ffmpeg_encoder.cache_clear()
+
+
+def test_listed_but_unloadable_nvenc_falls_back(fake_ffmpeg, monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.sys.platform", "linux")
+    assert resolve_video_encoder("hevc_nvenc") == "libx264"
+    assert resolve_video_encoder("auto") == "libx264"
+    probe = fake_ffmpeg.calls[0]
+    assert probe[probe.index("-f") + 1] == "lavfi"
+    assert probe[-2:] == ["null", "-"]
+
+
+def test_working_nvenc_is_probed_once(fake_ffmpeg, monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.sys.platform", "linux")
+    fake_ffmpeg.working.add("hevc_nvenc")
+    assert resolve_video_encoder("auto") == "hevc_nvenc"
+    assert resolve_video_encoder("hevc_nvenc") == "hevc_nvenc"
+    assert len(fake_ffmpeg.calls) == 1
+
+
+def test_auto_encoder_uses_videotoolbox_on_macos(fake_ffmpeg, monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.sys.platform", "darwin")
+    fake_ffmpeg.working.update({"h264_videotoolbox", "hevc_nvenc"})
+    assert resolve_video_encoder("auto") == "h264_videotoolbox"
+    fake_ffmpeg.working.clear()
+    has_ffmpeg_encoder.cache_clear()
+    assert resolve_video_encoder("auto") == "libx264"
+
+
+def test_explicit_encoder_is_honored(fake_ffmpeg, monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.sys.platform", "darwin")
+    fake_ffmpeg.working.update({"h264_videotoolbox", "hevc_nvenc"})
+    assert resolve_video_encoder("hevc_nvenc") == "hevc_nvenc"
+    assert resolve_video_encoder("libx264") == "libx264"
+
+
+def test_encoder_probe_survives_missing_ffmpeg(monkeypatch) -> None:
+    monkeypatch.setattr("verthor.auto_reframe.shutil.which", lambda _name: None)
+    has_ffmpeg_encoder.cache_clear()
+    try:
+        assert has_ffmpeg_encoder("hevc_nvenc") is False
+    finally:
+        has_ffmpeg_encoder.cache_clear()
 
 
 def test_pipe_writer_muxes_one_encode(tmp_path) -> None:
@@ -390,3 +501,102 @@ class _FakeCapture:
 class _FakeModel:
     names: dict[int, str] = {}
     predictor = None
+
+
+@pytest.mark.parametrize(
+    ("device", "cuda", "enabled", "expected"),
+    [
+        (None, True, True, True),
+        ("0", True, True, True),
+        ("0,1", True, True, True),
+        ("cuda:0", True, True, True),
+        ("cpu", True, True, False),
+        ("mps", True, True, False),
+        (None, False, True, False),
+        ("0", False, True, False),
+        ("0", True, False, False),
+    ],
+)
+def test_yolo_half_only_on_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+    device: str | None,
+    cuda: bool,
+    enabled: bool,
+    expected: bool,
+) -> None:
+    fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: cuda))
+    monkeypatch.setattr("verthor.auto_reframe.torch", fake_torch)
+    assert yolo_half_precision(device, enabled) is expected
+
+
+def test_no_half_flag() -> None:
+    assert build_namespace("in.mp4", "out.mp4").half is True
+    args = apply_preset(parse_args(["in.mp4", "out.mp4", "--no-half"]))
+    assert args.half is False
+
+
+def test_fp16_uses_quantize_when_ultralytics_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ultralytics import cfg
+
+    assert yolo_precision_kwargs(False) == {}
+    monkeypatch.setitem(cfg.DEFAULT_CFG_DICT, "quantize", None)
+    assert yolo_precision_kwargs(True) == {"quantize": 16}
+    monkeypatch.delitem(cfg.DEFAULT_CFG_DICT, "quantize")
+    assert yolo_precision_kwargs(True) == {"half": True}
+
+
+def test_prefetch_keeps_order() -> None:
+    with PrefetchIterator(iter(range(50)), maxsize=2) as items:
+        assert list(items) == list(range(50))
+
+
+def test_prefetch_reraises_producer_errors() -> None:
+    def source():
+        yield 1
+        yield 2
+        raise ValueError("decode failed")
+
+    items = PrefetchIterator(source(), maxsize=2)
+    assert next(items) == 1
+    assert next(items) == 2
+    with pytest.raises(ValueError, match="decode failed"):
+        next(items)
+    with pytest.raises(StopIteration):
+        next(items)
+    items.close()
+
+
+def test_prefetch_close_stops_and_closes_source() -> None:
+    import threading
+
+    produced: list[int] = []
+    closed = threading.Event()
+
+    def source():
+        try:
+            for i in range(1_000_000):
+                produced.append(i)
+                yield i
+        finally:
+            closed.set()
+
+    items = PrefetchIterator(source(), maxsize=2)
+    for i in items:
+        if i == 3:
+            break
+    items.close(timeout=5)
+    assert not items._thread.is_alive()
+    assert closed.is_set()
+    # Bounded queue: the producer ran at most a few items ahead.
+    assert len(produced) <= 4 + 3
+    with pytest.raises(StopIteration):
+        next(items)
+
+
+def test_prefetch_close_while_producer_blocks_on_full_queue() -> None:
+    items = PrefetchIterator(iter(range(100)), maxsize=1)
+    assert next(items) == 0
+    items.close(timeout=5)
+    assert not items._thread.is_alive()

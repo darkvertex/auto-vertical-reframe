@@ -56,7 +56,7 @@ output = replicate.run(
 )
 ```
 
-The image returns the vertical MP4, a JSON summary, and a debug MP4 when `save_debug_preview` is set. Presets match the CLI (`talking_head`, `sports`, `pets`, `cars`, `movie`, `comedian`). `duration` is seconds, and `0` reframes the whole clip. Saliency is `handcrafted` or `off`. DeepGaze is not in the image. YOLO runs on CUDA when a GPU is present, and on CPU otherwise. The default encoder is `hevc_nvenc`. If ffmpeg does not list it, the job falls back to `libx264`.
+The image returns the vertical MP4, a JSON summary, and a debug MP4 when `save_debug_preview` is set. Presets match the CLI (`talking_head`, `sports`, `pets`, `cars`, `movie`, `comedian`). `duration` is seconds, and `0` reframes the whole clip. Saliency is `handcrafted` or `off`. DeepGaze is not in the image. YOLO runs on CUDA when a GPU is present, and on CPU otherwise. The default encoder is `hevc_nvenc`. Before the job starts, ffmpeg encodes one test frame with it; if that fails (no GPU, or the NVENC driver library is not mounted), the job uses `libx264`. The Runpod image sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video` so NVENC is available. Cog does not allow setting `NVIDIA_*` variables, so Replicate jobs use NVENC only when the host runtime exposes it.
 
 Pushes to `main` build and publish that image. The release workflow reads `REPLICATE_CLI_AUTH_TOKEN` from the `production` GitHub Environment. That value is the CLI auth token from [replicate.com/auth/token](https://replicate.com/auth/token), not an `r8_` API token. Pull requests build the image and run a one-second CPU smoke test, and they do not push.
 
@@ -198,10 +198,11 @@ The whole pipeline lives in `src/verthor/auto_reframe.py`.
 | `--two-person-framing` | off (on for `sports`) | Frame two people together; `--no-two-person-framing` disables |
 | `--fast` | off | Smaller YOLO input, skip pose, masks, and saliency |
 | `--device` | auto | YOLO inference device (`cpu`, `mps`, `0`, …) |
+| `--no-half` | off | Keep YOLO in FP32 on CUDA. By default CUDA runs FP16 |
 | `--scene-threshold` | `3.0` | Scene-cut sensitivity. Detection samples at about 15 fps |
 | `--continuous` | off | One shot. Skip scene detection and its extra full decode |
-| `--pose-stride` | `1` | Run pose every N analyzed frames and reuse the last pose |
-| `--video-encoder` | `hevc_nvenc` | ffmpeg encoder. Falls back to `libx264` when that encoder is missing |
+| `--pose-stride` | `2` | Run pose every N analyzed frames and reuse the last pose. `1` runs it on every frame |
+| `--video-encoder` | `auto` | ffmpeg encoder. `auto` uses `h264_videotoolbox` on macOS and `hevc_nvenc` elsewhere. Any encoder that fails a one-frame test encode falls back to `libx264` |
 | `--crf` | `18` | Quality. `libx264` uses it as CRF; NVENC uses it as CQ |
 | `--post-restore` | off | Light denoise and unsharp pass in ffmpeg |
 

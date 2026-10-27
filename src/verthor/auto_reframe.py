@@ -5,13 +5,18 @@ import argparse
 import json
 import logging
 import math
+import queue
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -632,6 +637,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="YOLO inference device (cpu, mps, 0, ...). Default: auto-select.",
     )
+    parser.add_argument(
+        "--half",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run YOLO in FP16 on CUDA. --no-half keeps FP32.",
+    )
     parser.add_argument("--conf", type=float, default=0.30)
 
     parser.add_argument(
@@ -790,7 +801,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--pose-stride",
         type=int,
         default=None,
-        help="Run pose every N analyzed frames; reuse the last pose. Default 1.",
+        help="Run pose every N analyzed frames; reuse the last pose. Default 2.",
     )
     parser.add_argument(
         "--saliency-model",
@@ -825,7 +836,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Apply light unsharp/denoise during final ffmpeg stage",
     )
 
-    parser.add_argument("--video-encoder", default="hevc_nvenc")
+    parser.add_argument(
+        "--video-encoder",
+        default="auto",
+        help=(
+            "ffmpeg encoder. auto tries hevc_nvenc (h264_videotoolbox on macOS), "
+            "then libx264"
+        ),
+    )
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--preset-ffmpeg", default="medium")
 
@@ -888,7 +906,7 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     if args.face_stride is None:
         args.face_stride = int(preset.get("face_stride", 1))
     if args.pose_stride is None:
-        args.pose_stride = int(preset.get("pose_stride", 1))
+        args.pose_stride = int(preset.get("pose_stride", 2))
     if args.saliency_model is None:
         args.saliency_model = (
             "off" if args.camera_mode == "locked" or args.fast else "handcrafted"
@@ -905,7 +923,6 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     args.pose_stride = max(1, int(args.pose_stride))
     args.skip_saliency = args.saliency_model == "off"
     args.skip_pose = args.camera_mode == "locked" or args.fast
-    args.retina_masks = args.camera_mode != "locked" and not args.fast
     # Match on the filename so an absolute baked path still swaps to the
     # detection checkpoint that lives beside it.
     if args.camera_mode == "locked" and Path(args.seg_model).name == "yolo11n-seg.pt":
@@ -1460,6 +1477,25 @@ def mask_stats_from_binary_mask(
     return float(len(xs)), float(xs.mean()), float(ys.mean()), float(ys.min())
 
 
+def letterbox_gain_pad(
+    mask_w: int,
+    mask_h: int,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[float, float, float, float]:
+    """Gain and padding of a centered letterbox, as in ultralytics scale_boxes.
+
+    Non-retina YOLO masks are at the padded inference size (e.g. 640x384 for a
+    1080p frame at imgsz 640), not at the frame's aspect ratio.
+    """
+    gain = min(mask_h / frame_h, mask_w / frame_w)
+    new_h, new_w = round(frame_h * gain), round(frame_w * gain)
+    gain_x, gain_y = new_w / frame_w, new_h / frame_h
+    pad_x = round((mask_w - new_w) / 2 - 0.1)
+    pad_y = round((mask_h - new_h) / 2 - 0.1)
+    return gain_x, gain_y, float(pad_x), float(pad_y)
+
+
 def scaled_mask_stats(
     raw_mask: np.ndarray,
     frame_w: int,
@@ -1470,14 +1506,13 @@ def scaled_mask_stats(
     area, cx, cy, top = mask_stats_from_binary_mask(raw_mask > 0.5)
     if area <= 0 or mask_w == 0 or mask_h == 0:
         return area, cx, cy, top
-    scale_x = frame_w / mask_w
-    scale_y = frame_h / mask_h
+    gain_x, gain_y, pad_x, pad_y = letterbox_gain_pad(mask_w, mask_h, frame_w, frame_h)
     # Pixel-center mapping so a full-res mask and a scaled one share a centroid.
     return (
-        area * scale_x * scale_y,
-        (cx + 0.5) * scale_x - 0.5,
-        (cy + 0.5) * scale_y - 0.5,
-        top * scale_y,
+        area / (gain_x * gain_y),
+        clamp((cx + 0.5 - pad_x) / gain_x - 0.5, 0.0, frame_w - 1.0),
+        clamp((cy + 0.5 - pad_y) / gain_y - 0.5, 0.0, frame_h - 1.0),
+        clamp((top - pad_y) / gain_y, 0.0, frame_h - 1.0),
     )
 
 
@@ -3345,16 +3380,48 @@ def draw_debug(
     return dbg
 
 
+@cache
 def has_ffmpeg_encoder(encoder_name: str) -> bool:
+    """Encode one tiny frame with the encoder.
+
+    ``ffmpeg -encoders`` lists hardware encoders whose driver library is not
+    loadable (apt ffmpeg always lists ``hevc_nvenc``), so only a real encode
+    tells us the job will not fail at the end.
+    """
     if shutil.which("ffmpeg") is None:
         return False
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-encoders"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return encoder_name in result.stdout
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=s=256x256",
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        encoder_name,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logging.debug("Encoder probe for %s failed: %s", encoder_name, exc)
+        return False
+    if result.returncode != 0:
+        logging.debug(
+            "Encoder probe for %s failed: %s", encoder_name, result.stderr.strip()
+        )
+        return False
+    return True
 
 
 def build_video_filters(
@@ -3405,12 +3472,25 @@ def extract_source_clip(
         raise RuntimeError(result.stderr or "Failed to extract source clip")
 
 
+def default_encoder_candidates() -> list[str]:
+    if sys.platform == "darwin":
+        return ["h264_videotoolbox"]
+    return ["hevc_nvenc"]
+
+
 def resolve_video_encoder(video_encoder: str) -> str:
-    encoder = video_encoder or "libx264"
-    if not has_ffmpeg_encoder(encoder):
-        logging.warning("Encoder %s not found, fallback to libx264", encoder)
-        return "libx264"
-    return encoder
+    requested = video_encoder or "auto"
+    if requested == "auto":
+        candidates = default_encoder_candidates()
+    else:
+        candidates = [requested]
+    for encoder in candidates:
+        if encoder == "libx264" or has_ffmpeg_encoder(encoder):
+            logging.info("Video encoder: %s", encoder)
+            return encoder
+        logging.warning("Encoder %s is not usable, fallback to libx264", encoder)
+    logging.info("Video encoder: libx264")
+    return "libx264"
 
 
 def encoder_output_args(encoder: str, crf: int, preset: str) -> list[str]:
@@ -3801,6 +3881,108 @@ def open_microphone_model(weights: str) -> Any | None:
         return None
 
 
+class PrefetchIterator:
+    """Drain an iterator on a worker thread, a few items ahead of the consumer.
+
+    One thread pulls items in order, so stateful producers such as
+    ``model.track(persist=True)`` see the same call sequence. Producer errors
+    are re-raised by ``__next__``. ``close`` stops the worker and closes the
+    source iterator on the worker thread, which is the thread running it.
+    """
+
+    _ITEM, _ERROR, _END = range(3)
+
+    def __init__(self, source: Iterable[Any], maxsize: int = 2) -> None:
+        self._queue: queue.Queue[tuple[int, Any]] = queue.Queue(maxsize=maxsize)
+        self._stop = threading.Event()
+        self._finished = False
+        self.wait_s = 0.0
+        self._thread = threading.Thread(
+            target=self._run, args=(iter(source),), name="prefetch", daemon=True
+        )
+        self._thread.start()
+
+    def _put(self, item: tuple[int, Any]) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self, source: Iterator[Any]) -> None:
+        try:
+            for item in source:
+                if not self._put((self._ITEM, item)):
+                    break
+        except BaseException as exc:
+            self._put((self._ERROR, exc))
+        finally:
+            close = getattr(source, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as exc:
+                    logging.debug("Closing the prefetched source failed: %s", exc)
+            self._put((self._END, None))
+
+    def __iter__(self) -> PrefetchIterator:
+        return self
+
+    def __next__(self) -> Any:
+        if self._finished:
+            raise StopIteration
+        started = time.perf_counter()
+        kind, payload = self._queue.get()
+        self.wait_s += time.perf_counter() - started
+        if kind == self._ITEM:
+            return payload
+        self._finished = True
+        self._thread.join()
+        if kind == self._ERROR:
+            raise payload
+        raise StopIteration
+
+    def close(self, timeout: float = 30.0) -> None:
+        self._finished = True
+        self._stop.set()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            logging.warning("Prefetch thread did not stop within %.0fs", timeout)
+
+    def __enter__(self) -> PrefetchIterator:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+def yolo_half_precision(device: str | None, enabled: bool = True) -> bool:
+    """FP16 only on CUDA. CPU has no FP16 speedup and MPS support is uneven."""
+    if not enabled or torch is None or not torch.cuda.is_available():
+        return False
+    name = str(device or "").strip().lower()
+    if not name:
+        # Ultralytics picks CUDA itself when it is available.
+        return True
+    if name.startswith("cuda"):
+        return True
+    return all(part.strip().isdigit() for part in name.split(","))
+
+
+def yolo_precision_kwargs(half: bool) -> dict[str, Any]:
+    """FP16 request for model.track. Ultralytics 8.4 replaced ``half`` with
+    ``quantize`` and warns on every call that still passes ``half``."""
+    if not half:
+        return {}
+    from ultralytics.cfg import DEFAULT_CFG_DICT
+
+    if "quantize" in DEFAULT_CFG_DICT:
+        return {"quantize": 16}
+    return {"half": True}
+
+
 def process_video(
     args: argparse.Namespace,
     model: Any | None = None,
@@ -3838,9 +4020,11 @@ def process_video(
     speaker_segments = load_speaker_segments(args.speaker_json)
 
     yolo_device = args.device or None
+    yolo_half = yolo_half_precision(yolo_device, getattr(args, "half", True))
     logging.info(
         "Speed: model=%s imgsz=%s stride=%s face_stride=%s pose=%s "
-        "pose_stride=%s saliency=%s masks=%s device=%s continuous=%s mic=%s",
+        "pose_stride=%s saliency=%s device=%s half=%s "
+        "continuous=%s mic=%s",
         args.seg_model,
         args.imgsz,
         args.analyze_stride if args.camera_mode == "locked" else 1,
@@ -3848,8 +4032,8 @@ def process_video(
         not args.skip_pose,
         args.pose_stride,
         args.saliency_model,
-        args.retina_masks,
         yolo_device or "auto",
+        yolo_half,
         args.continuous,
         "on" if getattr(args, "mic_action", False) else "off",
     )
@@ -3881,7 +4065,7 @@ def process_video(
                 device=yolo_device,
             )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, ExitStack() as cleanup:
         tmpdir_path = Path(tmpdir)
         source_path = input_path
         timings = {
@@ -3890,6 +4074,7 @@ def process_video(
             "track": 0.0,
             "saliency": 0.0,
             "candidates": 0.0,
+            "yolo_wait": 0.0,
             "encode": 0.0,
         }
         clip_started = time.perf_counter()
@@ -4001,19 +4186,27 @@ def process_video(
             )
             logging.info("Locked stride 1; reusing decoded frames for the render")
         track_started = time.perf_counter()
-        results = model.track(
-            source=str(source_path),
-            stream=True,
-            persist=True,
-            tracker=args.tracker,
-            classes=allowed_class_ids,
-            conf=args.conf,
-            retina_masks=args.retina_masks,
-            imgsz=args.imgsz,
-            vid_stride=analyze_stride,
-            device=yolo_device,
-            verbose=False,
+        # Inference for the next frames runs while this thread does the CPU
+        # work (saliency, face, pose, crop, encode) for the current one.
+        results = PrefetchIterator(
+            model.track(
+                source=str(source_path),
+                stream=True,
+                persist=True,
+                tracker=args.tracker,
+                classes=allowed_class_ids,
+                conf=args.conf,
+                # Inference-size masks; scaled_mask_stats undoes the letterbox.
+                retina_masks=False,
+                imgsz=args.imgsz,
+                vid_stride=analyze_stride,
+                device=yolo_device,
+                **yolo_precision_kwargs(yolo_half),
+                verbose=False,
+            ),
+            maxsize=2,
         )
+        cleanup.enter_context(results)
 
         for result_idx, result in enumerate(results, start=1):
             frame = result.orig_img
@@ -4441,6 +4634,9 @@ def process_video(
                     saliency_telemetry.get("requested_backend"),
                 )
 
+        # Stop inference now if the loop ended early at max_process_frames.
+        results.close()
+
         if args.camera_mode == "locked":
             if not locked_intents:
                 raise RuntimeError("Locked camera mode produced no frame plan")
@@ -4480,6 +4676,7 @@ def process_video(
             )
 
         timings["track"] = time.perf_counter() - track_started
+        timings["yolo_wait"] = results.wait_s
         encode_started = time.perf_counter()
         writer.release()
         if debug_writer is not None:
@@ -4527,16 +4724,18 @@ def process_video(
             "timing_track_s": round(timings["track"], 3),
             "timing_saliency_s": round(timings["saliency"], 3),
             "timing_candidates_s": round(timings["candidates"], 3),
+            "timing_yolo_wait_s": round(timings["yolo_wait"], 3),
             "timing_encode_s": round(timings["encode"], 3),
         }
         logging.info(
             "Timing: clip=%.2fs scene=%.2fs track=%.2fs saliency=%.2fs "
-            "candidates=%.2fs encode=%.2fs",
+            "candidates=%.2fs yolo_wait=%.2fs encode=%.2fs",
             timings["clip"],
             timings["scene"],
             timings["track"],
             timings["saliency"],
             timings["candidates"],
+            timings["yolo_wait"],
             timings["encode"],
         )
         logging.info("Summary: %s", json.dumps(summary, ensure_ascii=False))
