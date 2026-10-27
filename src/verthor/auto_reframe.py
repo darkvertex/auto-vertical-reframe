@@ -801,7 +801,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--pose-stride",
         type=int,
         default=None,
-        help="Run pose every N analyzed frames; reuse the last pose. Default 1.",
+        help="Run pose every N analyzed frames; reuse the last pose. Default 2.",
     )
     parser.add_argument(
         "--saliency-model",
@@ -906,7 +906,7 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     if args.face_stride is None:
         args.face_stride = int(preset.get("face_stride", 1))
     if args.pose_stride is None:
-        args.pose_stride = int(preset.get("pose_stride", 1))
+        args.pose_stride = int(preset.get("pose_stride", 2))
     if args.saliency_model is None:
         args.saliency_model = (
             "off" if args.camera_mode == "locked" or args.fast else "handcrafted"

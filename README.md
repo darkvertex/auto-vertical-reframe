@@ -201,7 +201,7 @@ The whole pipeline lives in `src/verthor/auto_reframe.py`.
 | `--no-half` | off | Keep YOLO in FP32 on CUDA. By default CUDA runs FP16 |
 | `--scene-threshold` | `3.0` | Scene-cut sensitivity. Detection samples at about 15 fps |
 | `--continuous` | off | One shot. Skip scene detection and its extra full decode |
-| `--pose-stride` | `1` | Run pose every N analyzed frames and reuse the last pose |
+| `--pose-stride` | `2` | Run pose every N analyzed frames and reuse the last pose. `1` runs it on every frame |
 | `--video-encoder` | `auto` | ffmpeg encoder. `auto` uses `h264_videotoolbox` on macOS and `hevc_nvenc` elsewhere. Any encoder that fails a one-frame test encode falls back to `libx264` |
 | `--crf` | `18` | Quality. `libx264` uses it as CRF; NVENC uses it as CQ |
 | `--post-restore` | off | Light denoise and unsharp pass in ffmpeg |

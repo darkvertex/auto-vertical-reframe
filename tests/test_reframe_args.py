@@ -161,8 +161,10 @@ def test_non_positive_duration_is_rejected_before_opening_video() -> None:
         process_video(args)
 
 
-def test_pose_stride_defaults_to_every_frame() -> None:
+def test_pose_stride_defaults_to_every_other_frame() -> None:
     args = build_namespace("in.mp4", "out.mp4")
+    assert args.pose_stride == 2
+    args = apply_preset(parse_args(["in.mp4", "out.mp4", "--pose-stride", "1"]))
     assert args.pose_stride == 1
 
 
